@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -254,6 +255,7 @@ class Config:
     image_max_dim: int
     page_size: int
     max_items_per_cycle: int
+    concurrency: int
     shard_count: int
     shard_index: int
 
@@ -298,6 +300,7 @@ class Config:
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1280"))),
             page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "100")))),
             max_items_per_cycle=max(1, int(os.getenv("MAX_ITEMS_PER_CYCLE", "50"))),
+            concurrency=max(1, int(os.getenv("OCR_CONCURRENCY", "1"))),
             shard_count=shard_count,
             shard_index=shard_index,
         )
@@ -306,16 +309,17 @@ class Config:
 class OCRWorker:
     def __init__(self, config: Config, dashboard_state: DashboardState | None = None):
         self.config = config
-        self.session = requests.Session()
-        self.session.headers.update({"X-API-Key": self.config.api_key})
         self.dashboard_state = dashboard_state
+        self._write_lock = threading.Lock()
 
     def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         last_exc: requests.RequestException | None = None
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("X-API-Key", self.config.api_key)
 
         for attempt in range(1, self.config.request_retry_count + 1):
             try:
-                response = self.session.request(method, url, **kwargs)
+                response = requests.request(method, url, headers=headers, **kwargs)
                 response.raise_for_status()
                 return response
             except requests.HTTPError as exc:
@@ -402,7 +406,11 @@ class OCRWorker:
         return urljoin(f"{self.config.image_host_prefix}/", image_url.lstrip("/"))
 
     def _download_image_as_base64(self, image_url: str) -> str:
-        response = self.session.get(image_url, timeout=self.config.request_timeout_sec)
+        response = requests.get(
+            image_url,
+            headers={"X-API-Key": self.config.api_key},
+            timeout=self.config.request_timeout_sec,
+        )
         response.raise_for_status()
         image_bytes = response.content
 
@@ -586,6 +594,100 @@ class OCRWorker:
         shard = int.from_bytes(digest[:8], byteorder="big") % self.config.shard_count
         return shard == self.config.shard_index
 
+    def _process_media_item(self, item: dict[str, Any]) -> bool:
+        pk = str(item["pk"])
+        taken_at = int(item["taken_at"])
+        full_image_url = self._build_image_url(str(item["image_url"]))
+        if self.dashboard_state is not None:
+            self.dashboard_state.set_current_item(pk, taken_at, format_taken_at(taken_at))
+        logger.info(
+            "Processing pk=%s taken_at=%s (%s) image=%s",
+            pk,
+            taken_at,
+            format_taken_at(taken_at),
+            full_image_url,
+        )
+
+        try:
+            text, background, profile_estimate, is_pr, no_text_detected = self.run_lm_studio_ocr(full_image_url)
+        except (requests.RequestException, ValueError):
+            if self.dashboard_state is not None:
+                self.dashboard_state.increment_failed()
+                self.dashboard_state.clear_current_item()
+            logger.exception("OCR failed pk=%s image=%s", pk, full_image_url)
+            return False
+
+        if not text.strip():
+            text = " "
+        if not background.strip():
+            background = " "
+        if not profile_estimate.strip():
+            profile_estimate = " "
+
+        with self._write_lock:
+            try:
+                self.post_ocr_result(
+                    pk,
+                    text,
+                    background,
+                    profile_estimate,
+                    is_pr,
+                    no_text_detected,
+                )
+            except requests.RequestException as exc:
+                if self.dashboard_state is not None:
+                    self.dashboard_state.increment_failed()
+                    self.dashboard_state.clear_current_item()
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                logger.error(
+                    "POST failed pk=%s status=%s body=%s",
+                    pk,
+                    status,
+                    response_body_for_log(exc.response),
+                )
+                return False
+
+            if self.dashboard_state is not None:
+                self.dashboard_state.increment_processed()
+                self.dashboard_state.clear_current_item()
+            logger.info(
+                "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s no_text_detected=%s",
+                pk,
+                taken_at,
+                format_taken_at(taken_at),
+                is_pr,
+                no_text_detected,
+            )
+            time.sleep(self.config.write_interval_sec)
+        return True
+
+    def _process_media_batch(self, items: list[dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        if self.config.concurrency == 1 or len(items) == 1:
+            return sum(1 for item in items if self._process_media_item(item))
+
+        processed_count = 0
+        worker_count = min(self.config.concurrency, len(items))
+        logger.info(
+            "Processing batch items=%s concurrency=%s",
+            len(items),
+            worker_count,
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(self._process_media_item, item) for item in items]
+            for future in as_completed(futures):
+                try:
+                    succeeded = future.result()
+                except Exception:
+                    if self.dashboard_state is not None:
+                        self.dashboard_state.increment_failed()
+                    logger.exception("Unexpected error while processing OCR batch item")
+                    continue
+                if succeeded:
+                    processed_count += 1
+        return processed_count
+
     def process_cycle(self) -> dict[str, int]:
         processed_count = 0
         skipped_count = 0
@@ -602,9 +704,9 @@ class OCRWorker:
             if not media_list:
                 break
 
+            batch: list[dict[str, Any]] = []
             for item in media_list:
                 pk = str(item["pk"])
-                taken_at = int(item["taken_at"])
 
                 if not self._is_assigned_to_this_shard(pk):
                     skipped_count += 1
@@ -629,75 +731,19 @@ class OCRWorker:
                     )
                     continue
 
-                if processed_count >= self.config.max_items_per_cycle:
+                if processed_count + len(batch) >= self.config.max_items_per_cycle:
                     logger.info(
-                        "Reached cycle limit processed=%s max_items_per_cycle=%s",
+                        "Reached cycle limit processed=%s queued=%s max_items_per_cycle=%s",
                         processed_count,
+                        len(batch),
                         self.config.max_items_per_cycle,
                     )
                     should_stop = True
                     break
 
-                full_image_url = self._build_image_url(str(item["image_url"]))
-                if self.dashboard_state is not None:
-                    self.dashboard_state.set_current_item(pk, taken_at, format_taken_at(taken_at))
-                logger.info(
-                    "Processing pk=%s taken_at=%s (%s) image=%s",
-                    pk,
-                    taken_at,
-                    format_taken_at(taken_at),
-                    full_image_url,
-                )
+                batch.append(item)
 
-                try:
-                    text, background, profile_estimate, is_pr, no_text_detected = self.run_lm_studio_ocr(full_image_url)
-                except (requests.RequestException, ValueError):
-                    if self.dashboard_state is not None:
-                        self.dashboard_state.increment_failed()
-                        self.dashboard_state.clear_current_item()
-                    logger.exception("OCR failed pk=%s image=%s", pk, full_image_url)
-                    continue
-
-                if not text.strip():
-                    text = " "
-                if not background.strip():
-                    background = " "
-                if not profile_estimate.strip():
-                    profile_estimate = " "
-
-                try:
-                    self.post_ocr_result(
-                        pk,
-                        text,
-                        background,
-                        profile_estimate,
-                        is_pr,
-                        no_text_detected,
-                    )
-                except requests.HTTPError as exc:
-                    if self.dashboard_state is not None:
-                        self.dashboard_state.increment_failed()
-                        self.dashboard_state.clear_current_item()
-                    logger.error(
-                        "POST failed pk=%s status=%s body=%s",
-                        pk,
-                        exc.response.status_code if exc.response is not None else "unknown",
-                        response_body_for_log(exc.response),
-                    )
-                    continue
-                processed_count += 1
-                if self.dashboard_state is not None:
-                    self.dashboard_state.increment_processed()
-                    self.dashboard_state.clear_current_item()
-                logger.info(
-                    "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s no_text_detected=%s",
-                    pk,
-                    taken_at,
-                    format_taken_at(taken_at),
-                    is_pr,
-                    no_text_detected,
-                )
-                time.sleep(self.config.write_interval_sec)
+            processed_count += self._process_media_batch(batch)
 
             if should_stop or next_before_taken_at is None:
                 break
@@ -712,8 +758,9 @@ class OCRWorker:
 
     def run_forever(self) -> None:
         logger.info(
-            "Starting OCR worker with model=%s shard_index=%s shard_count=%s",
+            "Starting OCR worker with model=%s concurrency=%s shard_index=%s shard_count=%s",
             self.config.lm_studio_model,
+            self.config.concurrency,
             self.config.shard_index,
             self.config.shard_count,
         )

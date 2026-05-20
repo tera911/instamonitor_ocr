@@ -6,6 +6,8 @@
 
 backlog が多い場合は `MAX_ITEMS_PER_CYCLE` で 1 サイクルあたりの処理件数を制限できます。上限に達したらその時点でサイクルを終え、次のポーリングで再び最新未処理から取り直します。
 
+同一プロセス内で複数画像を並列に OCR したい場合は `OCR_CONCURRENCY` を設定します。デフォルトは従来どおり `1` です。ローカル LLM 側の GPU/VRAM 状況に依存するため、まず `OCR_CONCURRENCY=2` から試し、ダッシュボードの毎分処理件数と失敗率を見ながら上げてください。
+
 複数台で動かす場合は `OCR_SHARD_COUNT` と `OCR_SHARD_INDEX` で担当範囲を分けられます。例えば 2 台なら 1 台目を `OCR_SHARD_COUNT=2` / `OCR_SHARD_INDEX=0`、2 台目を `OCR_SHARD_COUNT=2` / `OCR_SHARD_INDEX=1` にします。1 台運用に戻す場合は `OCR_SHARD_COUNT=1` / `OCR_SHARD_INDEX=0`、または未設定で全件処理します。
 
 常駐モードでは、処理対象がある限り次サイクルへ即時進みます。処理対象がない時やエラー時だけ `IDLE_SLEEP_SEC` だけ待機します。デフォルトは `60` 秒です。
@@ -28,6 +30,7 @@ export OCR_API_BASE_URL="https://your-host/api/ocr"
 export OCR_IMAGE_HOST_PREFIX="https://your-host"
 export OCR_API_KEY="your-api-key"
 export OCR_VERSION="2026-04-11"
+export OCR_CONCURRENCY="1"
 export OCR_SHARD_COUNT="1"
 export OCR_SHARD_INDEX="0"
 export LM_STUDIO_API_URL="http://127.0.0.1:1234/v1/chat/completions"
