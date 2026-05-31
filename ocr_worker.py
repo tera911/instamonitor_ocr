@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -242,6 +242,7 @@ class OCRResult:
 class Config:
     api_base_url: str
     image_host_prefix: str
+    image_local_root: Path | None
     api_key: str
     include_done: bool
     ocr_version: str
@@ -279,9 +280,23 @@ class Config:
         if shard_index < 0 or shard_index >= shard_count:
             raise ValueError("OCR_SHARD_INDEX must be greater than or equal to 0 and less than OCR_SHARD_COUNT.")
 
+        local_root_raw = os.getenv("OCR_IMAGE_LOCAL_ROOT", "").strip()
+        image_local_root: Path | None = None
+        if local_root_raw:
+            resolved = Path(local_root_raw).expanduser().resolve()
+            if resolved.is_dir():
+                image_local_root = resolved
+            else:
+                logger.warning(
+                    "OCR_IMAGE_LOCAL_ROOT=%s does not exist or is not a directory; "
+                    "falling back to HTTP-only image loading.",
+                    resolved,
+                )
+
         return cls(
             api_base_url=api_base_url,
             image_host_prefix=image_host_prefix,
+            image_local_root=image_local_root,
             api_key=api_key,
             include_done=os.getenv("OCR_INCLUDE_DONE", "0").strip() in {"1", "true", "yes", "on"},
             ocr_version=os.getenv("OCR_VERSION", "2026-05-31").strip(),
@@ -400,14 +415,50 @@ class OCRWorker:
             return image_url
         return urljoin(f"{self.config.image_host_prefix}/", image_url.lstrip("/"))
 
-    def _download_image_as_base64(self, image_url: str) -> str:
+    def _resolve_local_image_path(self, image_url: str) -> Path | None:
+        root = self.config.image_local_root
+        if root is None:
+            return None
+
+        parsed = urlparse(image_url)
+        relative = parsed.path.lstrip("/") if parsed.scheme else image_url.lstrip("/")
+        if not relative:
+            return None
+
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            logger.warning(
+                "Local image path escapes OCR_IMAGE_LOCAL_ROOT, falling back to HTTP: url=%s candidate=%s",
+                image_url,
+                candidate,
+            )
+            return None
+        return candidate
+
+    def _load_image_bytes(self, image_url: str) -> bytes:
+        local_path = self._resolve_local_image_path(image_url)
+        if local_path is not None:
+            if local_path.is_file():
+                logger.info("Loaded image from local mount path=%s", local_path)
+                return local_path.read_bytes()
+            logger.warning(
+                "Local image not found, falling back to HTTP: path=%s url=%s",
+                local_path,
+                image_url,
+            )
+
         response = requests.get(
             image_url,
             headers={"X-API-Key": self.config.api_key},
             timeout=self.config.request_timeout_sec,
         )
         response.raise_for_status()
-        image_bytes = response.content
+        return response.content
+
+    def _download_image_as_base64(self, image_url: str) -> str:
+        image_bytes = self._load_image_bytes(image_url)
 
         if Image is not None:
             try:
@@ -978,6 +1029,14 @@ def main() -> int:
     except ValueError as exc:
         logger.error("%s", exc)
         return 2
+
+    if config.image_local_root is not None:
+        logger.info(
+            "Image loading mode: local root=%s (HTTP fallback enabled)",
+            config.image_local_root,
+        )
+    else:
+        logger.info("Image loading mode: HTTP only (OCR_IMAGE_LOCAL_ROOT not set)")
 
     if args.test:
         worker = OCRWorker(config)

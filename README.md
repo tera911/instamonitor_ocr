@@ -12,6 +12,8 @@ backlog が多い場合は `MAX_ITEMS_PER_CYCLE` で 1 サイクルあたりの�
 
 常駐モードでは、処理対象がある限り次サイクルへ即時進みます。処理対象がない時やエラー時だけ `IDLE_SLEEP_SEC` だけ待機します。デフォルトは `60` 秒です。
 
+画像を CDN 経由ではなく S3 マウント等のローカルパスから直接読みたい場合は `OCR_IMAGE_LOCAL_ROOT` を設定します。例えば `OCR_IMAGE_LOCAL_ROOT=~/s3` にすると、`https://your-host/stories/xxx.jpg` のような URL は `~/s3/stories/xxx.jpg` から読みます。ファイルが存在しない場合は WARNING を出した上で従来通り HTTP にフォールバックします（マウント外れに気付きつつ処理は止めない）。未設定なら従来通り常に HTTP 経由です。
+
 ## 前提
 
 - `python3`
@@ -30,6 +32,8 @@ export OCR_API_BASE_URL="https://your-host/api/ocr"
 export OCR_IMAGE_HOST_PREFIX="https://your-host"
 export OCR_API_KEY="your-api-key"
 export OCR_VERSION="2026-05-31"
+# 任意: S3 マウントなどローカルから読みたい場合に設定 (未設定なら CDN 経由)
+# export OCR_IMAGE_LOCAL_ROOT="$HOME/s3"
 export OCR_CONCURRENCY="1"
 export OCR_SHARD_COUNT="1"
 export OCR_SHARD_INDEX="0"
