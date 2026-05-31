@@ -469,7 +469,7 @@ class OCRWorker:
         no_text_detected = bool(parsed.get("no_text_detected", False))
         return text, background, profile_estimate, is_pr, no_text_detected
 
-    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str) -> tuple[str, str, str, bool, bool]:
+    def _call_lm_studio(self, image_url: str, prompt: str) -> tuple[str, float]:
         started_at = time.perf_counter()
         image_b64 = self._download_image_as_base64(image_url)
         payload = {
@@ -515,8 +515,12 @@ class OCRWorker:
             .get("message", {})
             .get("content", "")
         )
-        text, background, profile_estimate, is_pr, no_text_detected = self._parse_lm_studio_response(raw_text)
         elapsed_sec = time.perf_counter() - started_at
+        return raw_text, elapsed_sec
+
+    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str) -> tuple[str, str, str, bool, bool]:
+        raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt)
+        text, background, profile_estimate, is_pr, no_text_detected = self._parse_lm_studio_response(raw_text)
         logger.info(
             "OCR complete elapsed=%.2fs result=%s",
             elapsed_sec,
@@ -532,6 +536,61 @@ class OCRWorker:
             ),
         )
         return text, background, profile_estimate, is_pr, no_text_detected
+
+    def run_test_mode(self, limit: int) -> int:
+        payload = self.fetch_latest_media()
+        items = payload.get("data", [])[:limit]
+        if not items:
+            logger.warning(
+                "No items returned from /media/latest. "
+                "Set OCR_INCLUDE_DONE=1 to also include already-OCR'd items.",
+            )
+            return 0
+
+        logger.info(
+            "Test mode: running OCR on %s item(s). Results will NOT be posted back to the API.",
+            len(items),
+        )
+        logger.info("Prompt in use:\n%s", self.config.lm_studio_prompt)
+
+        for index, item in enumerate(items, start=1):
+            pk = str(item["pk"])
+            taken_at = int(item["taken_at"])
+            image_url = self._build_image_url(str(item["image_url"]))
+
+            logger.info("=" * 80)
+            logger.info(
+                "[%s/%s] pk=%s taken_at=%s (%s) image=%s",
+                index,
+                len(items),
+                pk,
+                taken_at,
+                format_taken_at(taken_at),
+                image_url,
+            )
+
+            try:
+                raw_text, elapsed_sec = self._call_lm_studio(image_url, self.config.lm_studio_prompt)
+            except (requests.RequestException, ValueError):
+                logger.exception("LM Studio call failed pk=%s", pk)
+                continue
+
+            logger.info("--- raw response (elapsed=%.2fs) ---\n%s", elapsed_sec, raw_text)
+
+            try:
+                text, background, profile_estimate, is_pr, no_text_detected = self._parse_lm_studio_response(raw_text)
+            except ValueError as exc:
+                logger.error("Failed to parse LM Studio response pk=%s error=%s", pk, exc)
+                continue
+
+            logger.info("--- parsed text ---\n%s", text)
+            logger.info("--- parsed background ---\n%s", background)
+            logger.info("--- parsed profile_estimate ---\n%s", profile_estimate)
+            logger.info("is_pr=%s  no_text_detected=%s", is_pr, no_text_detected)
+
+        logger.info("=" * 80)
+        logger.info("Test mode complete.")
+        return 0
 
     def run_lm_studio_ocr(self, image_url: str) -> tuple[str, str, str, bool, bool]:
         last_exc: Exception | None = None
@@ -800,17 +859,29 @@ class OCRWorker:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Continuously fetch Instagram media, run OCR with local Ollama, and write results back."
+        description=(
+            "Continuously fetch Instagram media, run OCR with local LM Studio, and write results back. "
+            "Default behavior is the terminal dashboard."
+        )
     )
     parser.add_argument(
-        "--once",
+        "--no-dashboard",
         action="store_true",
-        help="Run a single polling cycle and exit.",
+        help="Run continuously without the terminal dashboard. Streams logs to stdout (for systemd/headless).",
     )
     parser.add_argument(
-        "--dashboard",
+        "--test",
         action="store_true",
-        help="Show a terminal dashboard with recent logs and processed-per-minute bars.",
+        help=(
+            "Test mode: fetch a few items, run OCR with the configured prompt, "
+            "print raw and parsed results to stdout, and exit. Does NOT post results to the API."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Number of items to test in --test mode. Default: 3.",
     )
     return parser.parse_args()
 
@@ -947,37 +1018,30 @@ def main() -> int:
         logger.error("%s", exc)
         return 2
 
-    dashboard_state = DashboardState() if args.dashboard else None
-    if dashboard_state is not None:
-        root_logger = logging.getLogger()
-        for handler in list(root_logger.handlers):
-            if isinstance(handler, logging.StreamHandler):
-                root_logger.removeHandler(handler)
-        for handler in list(logger.handlers):
-            if isinstance(handler, logging.StreamHandler):
-                logger.removeHandler(handler)
-        logger.propagate = False
-        handler = DashboardLogHandler(dashboard_state)
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(handler)
+    if args.test:
+        worker = OCRWorker(config)
+        return worker.run_test_mode(args.limit)
 
-    worker = OCRWorker(config, dashboard_state=dashboard_state)
-
-    if args.once:
-        stats = worker.process_cycle()
-        logger.info(
-            "Single cycle complete pages=%s processed=%s skipped=%s",
-            stats["pages"],
-            stats["processed"],
-            stats["skipped"],
-        )
+    if args.no_dashboard:
+        worker = OCRWorker(config)
+        worker.run_forever()
         return 0
 
-    if args.dashboard:
-        return run_with_dashboard(worker, dashboard_state)
+    dashboard_state = DashboardState()
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            root_logger.removeHandler(handler)
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            logger.removeHandler(handler)
+    logger.propagate = False
+    handler = DashboardLogHandler(dashboard_state)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
 
-    worker.run_forever()
-    return 0
+    worker = OCRWorker(config, dashboard_state=dashboard_state)
+    return run_with_dashboard(worker, dashboard_state)
 
 
 if __name__ == "__main__":
