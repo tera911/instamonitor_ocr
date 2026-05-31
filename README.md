@@ -29,7 +29,7 @@ virtualenv .venv
 export OCR_API_BASE_URL="https://your-host/api/ocr"
 export OCR_IMAGE_HOST_PREFIX="https://your-host"
 export OCR_API_KEY="your-api-key"
-export OCR_VERSION="2026-04-11"
+export OCR_VERSION="2026-05-31"
 export OCR_CONCURRENCY="1"
 export OCR_SHARD_COUNT="1"
 export OCR_SHARD_INDEX="0"
@@ -58,20 +58,19 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 .venv/bin/python ocr_worker.py --test --limit 1  # 件数指定
 ```
 
-`--test` は `LM_STUDIO_OCR_PROMPT`（未設定なら `DEFAULT_PROMPT`）をそのまま 1 回試行し、retry も fallback prompt も使いません。`OCR_INCLUDE_DONE=1` を設定すれば、すでに OCR 済みの投稿に対してもプロンプトを試せます。
+`--test` は `LM_STUDIO_OCR_PROMPT`（未設定なら `DEFAULT_PROMPT`）をそのまま 1 回試行します。`OCR_INCLUDE_DONE=1` を設定すれば、すでに OCR 済みの投稿に対してもプロンプトを試せます。
 
 ## プロンプト
 
-実際にモデルへ投げているプロンプトは `ocr_worker.py` 内に定数として置いてあります。プロンプトを変えたいときは下記を直接編集するか、`LM_STUDIO_OCR_PROMPT` 環境変数で `DEFAULT_PROMPT` を上書きしてください。`FALLBACK_PROMPT` は再試行専用でコード固定です。
+実際にモデルへ投げているプロンプトは `ocr_worker.py` 内に定数として置いてあります。プロンプトを変えたいときは下記を直接編集するか、`LM_STUDIO_OCR_PROMPT` 環境変数で `DEFAULT_PROMPT` を上書きしてください。
 
-- [`DEFAULT_PROMPT`](./ocr_worker.py#L30-L52) — 初回試行 / `--test` モードで使われるもの
-- [`FALLBACK_PROMPT`](./ocr_worker.py#L54-L66) — 再試行時に切り替わる軽量版
+- [`DEFAULT_PROMPT`](./ocr_worker.py#L30-L60) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
+
+旧 `FALLBACK_PROMPT` および OCR 自体の retry は廃止しています。LM Studio の返答が空 / 不正 JSON だった場合は即時失敗扱いとし、原因をログから追って prompt 側を直す方針です。
 
 ## 出力JSON
 
 ### モデルに要求している返却 JSON
-
-`DEFAULT_PROMPT` 版:
 
 ```json
 {
@@ -79,21 +78,13 @@ systemd や cron などダッシュボードを出せない環境向けにログ
   "background": "<画像の視覚的背景の簡潔な説明 (日本語, 1-3文)>",
   "profile_estimate": "<投稿者プロフィールの推定 (日本語, 1-3文, 推定であることを明示)>",
   "is_pr": true,
+  "is_ugc": true,
+  "tags": ["タグ1", "タグ2"],
   "no_text_detected": false
 }
 ```
 
-`FALLBACK_PROMPT` 版（`background` / `profile_estimate` を要求しない）:
-
-```json
-{
-  "text": "<抽出した本文>",
-  "is_pr": true,
-  "no_text_detected": false
-}
-```
-
-パーサーは余分な前後文字列があっても最初の `{` から最後の `}` までを切り出して JSON として読みます。それでも JSON にならない / オブジェクトでない場合はエラー扱いで再試行します。
+パーサーは余分な前後文字列があっても最初の `{` から最後の `}` までを切り出して JSON として読みます。それでも JSON にならない / オブジェクトでない場合はエラー扱いで失敗させます。
 
 ### API に POST する JSON
 
@@ -105,17 +96,21 @@ systemd や cron などダッシュボードを出せない環境向けにログ
   "background": "<背景説明 (空なら ' ')>",
   "profile_estimate": "<プロフィール推定 (空なら ' ')>",
   "is_pr": true,
+  "is_ugc": true,
+  "tags": ["タグ1", "タグ2"],
   "no_text_detected": false,
-  "version": "<OCR_VERSION の値, 例: 2026-04-11>"
+  "version": "<OCR_VERSION の値, 例: 2026-05-31>"
 }
 ```
 
 | フィールド | 型 | 説明 |
 | --- | --- | --- |
 | `text` | string | 抽出本文。`no_text_detected=true` の場合は空でよい。 |
-| `background` | string | 画像の視覚的背景（日本語）。`FALLBACK_PROMPT` 採用時は空で送信される。 |
-| `profile_estimate` | string | 投稿者プロフィールの推定（日本語、推定であることを明示）。`FALLBACK_PROMPT` 採用時は空で送信される。 |
-| `is_pr` | boolean | PR 投稿らしい兆候 (#PR・購入リンク・価格表示など) があれば `true`。 |
+| `background` | string | 画像の視覚的背景（日本語）。 |
+| `profile_estimate` | string | 投稿者プロフィールの推定（日本語、推定であることを明示）。 |
+| `is_pr` | boolean | 画像内に「PR」というリテラル文字（大文字小文字問わず）が読み取れる場合のみ `true`。 |
+| `is_ugc` | boolean | 購入リンク（"link in bio"・URL・クリップボードアイコン等）や価格・割引・クーポンなどの購買性シグナルが目立つ場合に `true`。 |
+| `tags` | string[] | LLM がルール無視で自由に付ける投稿タグ（日本語、`#` なし、目安 3-10 個）。空配列もあり得る。 |
 | `no_text_detected` | boolean | 読み取れるテキストが本当に存在しないと判断した場合のみ `true`。部分的にでも読めれば `false`。 |
 | `version` | string | このワーカーが書き込んだプロンプト/出力形式のバージョン (`OCR_VERSION`)。プロンプトや出力形式を更新したらここを変えて再 OCR を走らせる。 |
 
@@ -123,10 +118,8 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 `LM Studio` 側は OpenAI 互換 API を前提にしています。OCR には画像入力対応モデルが必要です。テキスト専用モデルでは動きません。
 
-OCR 結果は `text` に加えて `background`、`profile_estimate`、`version` を送信します。プロンプトや出力形式を更新して再OCRしたいときは `OCR_VERSION` を変更し、必要に応じて `OCR_INCLUDE_DONE=1` で既存投稿も取得してください。
+プロンプトや出力形式を更新して再OCRしたいときは `OCR_VERSION` を変更し、必要に応じて `OCR_INCLUDE_DONE=1` で既存投稿も取得してください。
 
-OCR が空だった場合は `no_text_detected` も送信します。モデルが `no_text_detected=true` と明示した場合はそのまま採用し、それ以外の失敗や空結果は `OCR_RETRY_COUNT` 回まで再試行します。
-
-画像は OCR 前にアスペクト比を維持したまま長辺 `IMAGE_MAX_DIM` まで縮小します。初回は詳細 prompt、再試行時は token 消費を抑えた軽量 OCR prompt に切り替えます。
+画像は OCR 前にアスペクト比を維持したまま長辺 `IMAGE_MAX_DIM` まで縮小します。
 
 デフォルトのダッシュボードでは上段に色付きログ、下段に毎分の成功/失敗件数グラフ、ヘッダに現在処理中の投稿と累計件数を表示します。`q` で抜けられます。

@@ -32,38 +32,32 @@ Extract all visible text as faithfully as possible.
 Do not translate, rewrite, summarize, or normalize the text.
 Return the original text exactly as it appears.
 Keep line breaks when they are visually meaningful.
-Also decide whether this should be treated as a PR post.
-Set is_pr=true when the image strongly suggests PR content, especially when:
-- the image includes #PR
+
+Set is_pr=true ONLY when the image visually contains the literal characters "PR" (case-insensitive) as readable text. Otherwise set is_pr=false.
+
+Set is_ugc=true when the image strongly suggests promotional/commerce content, especially when:
 - the image suggests a product or purchase link, including a clipboard/link-copy icon, "link in bio", URL-like notation, shop guidance, or similar cues
 - the image prominently presents prices, discounts, sale amounts, campaign offers, coupon-style amounts, or other purchase-oriented money information
+Otherwise set is_ugc=false.
+
+Also generate tags as a list of short Japanese strings that describe or categorize this post. There are no strict rules — pick whatever tags you think fit (topic, mood, product category, audience, vibe, etc.). Typically 3-10 tags. Each tag is a short noun phrase, no leading "#".
+
 Also describe the visual background briefly in background.
 - Focus on non-text visual context such as people, objects, layout, scenery, colors, product shots, screenshots, UI elements, and overall composition.
 - Keep background concise, usually 1-3 short sentences.
 - Write background in Japanese.
+
 Also provide profile_estimate in Japanese as a free-form estimate of the poster/account style or likely profile.
 - Keep it short, usually 1-3 short sentences.
 - Treat it as a tentative estimate, not a fact.
 - If there is not enough information, say so.
 - Avoid highly sensitive traits or overconfident claims.
-If the image truly contains no readable text, set no_text_detected=true.
-Set no_text_detected=false whenever there is any readable text, even if partial.
-Return only valid JSON in exactly this shape:
-{"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"no_text_detected":false}"""
 
-FALLBACK_PROMPT = """You are performing OCR on an Instagram image.
-Extract visible text as faithfully as possible.
-Do not translate, rewrite, summarize, or normalize the text.
-Return the original text exactly as it appears.
 If the image truly contains no readable text, set no_text_detected=true.
 Set no_text_detected=false whenever there is any readable text, even if partial.
-Also decide whether this should be treated as a PR post.
-Set is_pr=true when the image strongly suggests PR content, especially when:
-- the image includes #PR
-- the image suggests a product or purchase link, including a clipboard/link-copy icon, "link in bio", URL-like notation, shop guidance, or similar cues
-- the image prominently presents prices, discounts, sale amounts, campaign offers, coupon-style amounts, or other purchase-oriented money information
+
 Return only valid JSON in exactly this shape:
-{"text":"<extracted text>","is_pr":true,"no_text_detected":false}"""
+{"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"is_ugc":true,"tags":["tag1","tag2"],"no_text_detected":false}"""
 
 
 logging.basicConfig(
@@ -234,6 +228,17 @@ def wrap_log_entries(
 
 
 @dataclass
+class OCRResult:
+    text: str
+    background: str
+    profile_estimate: str
+    is_pr: bool
+    is_ugc: bool
+    tags: list[str]
+    no_text_detected: bool
+
+
+@dataclass
 class Config:
     api_base_url: str
     image_host_prefix: str
@@ -250,8 +255,6 @@ class Config:
     lm_studio_timeout_sec: int
     request_retry_count: int
     request_retry_backoff_sec: float
-    ocr_retry_count: int
-    ocr_retry_backoff_sec: float
     image_max_dim: int
     page_size: int
     max_items_per_cycle: int
@@ -281,7 +284,7 @@ class Config:
             image_host_prefix=image_host_prefix,
             api_key=api_key,
             include_done=os.getenv("OCR_INCLUDE_DONE", "0").strip() in {"1", "true", "yes", "on"},
-            ocr_version=os.getenv("OCR_VERSION", "2026-04-11").strip(),
+            ocr_version=os.getenv("OCR_VERSION", "2026-05-31").strip(),
             lm_studio_url=os.getenv(
                 "LM_STUDIO_API_URL",
                 "http://127.0.0.1:1234/v1/chat/completions",
@@ -295,8 +298,6 @@ class Config:
             lm_studio_timeout_sec=int(os.getenv("LM_STUDIO_TIMEOUT_SEC", "180")),
             request_retry_count=max(1, int(os.getenv("REQUEST_RETRY_COUNT", "3"))),
             request_retry_backoff_sec=float(os.getenv("REQUEST_RETRY_BACKOFF_SEC", "2.0")),
-            ocr_retry_count=max(1, int(os.getenv("OCR_RETRY_COUNT", "3"))),
-            ocr_retry_backoff_sec=float(os.getenv("OCR_RETRY_BACKOFF_SEC", "1.5")),
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1280"))),
             page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "100")))),
             max_items_per_cycle=max(1, int(os.getenv("MAX_ITEMS_PER_CYCLE", "50"))),
@@ -370,21 +371,15 @@ class OCRWorker:
         )
         return response.json()
 
-    def post_ocr_result(
-        self,
-        pk: str,
-        text: str,
-        background: str,
-        profile_estimate: str,
-        is_pr: bool,
-        no_text_detected: bool,
-    ) -> None:
+    def post_ocr_result(self, pk: str, result: OCRResult) -> None:
         payload = {
-            "text": text if text.strip() else " ",
-            "background": background if background.strip() else " ",
-            "profile_estimate": profile_estimate if profile_estimate.strip() else " ",
-            "is_pr": is_pr,
-            "no_text_detected": no_text_detected,
+            "text": result.text if result.text.strip() else " ",
+            "background": result.background if result.background.strip() else " ",
+            "profile_estimate": result.profile_estimate if result.profile_estimate.strip() else " ",
+            "is_pr": result.is_pr,
+            "is_ugc": result.is_ugc,
+            "tags": result.tags,
+            "no_text_detected": result.no_text_detected,
             "version": self.config.ocr_version,
         }
         logger.info(
@@ -447,7 +442,7 @@ class OCRWorker:
 
         return base64.b64encode(image_bytes).decode("ascii")
 
-    def _parse_lm_studio_response(self, response_text: str) -> tuple[str, str, str, bool, bool]:
+    def _parse_lm_studio_response(self, response_text: str) -> OCRResult:
         raw = response_text.strip()
 
         try:
@@ -462,12 +457,21 @@ class OCRWorker:
         if not isinstance(parsed, dict):
             raise ValueError(f"LM Studio returned non-object JSON: {truncate_for_log(raw)}")
 
-        text = str(parsed.get("text", "")).strip()
-        background = str(parsed.get("background", "")).strip()
-        profile_estimate = str(parsed.get("profile_estimate", "")).strip()
-        is_pr = bool(parsed.get("is_pr", False))
-        no_text_detected = bool(parsed.get("no_text_detected", False))
-        return text, background, profile_estimate, is_pr, no_text_detected
+        raw_tags = parsed.get("tags", [])
+        if isinstance(raw_tags, list):
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            tags = []
+
+        return OCRResult(
+            text=str(parsed.get("text", "")).strip(),
+            background=str(parsed.get("background", "")).strip(),
+            profile_estimate=str(parsed.get("profile_estimate", "")).strip(),
+            is_pr=bool(parsed.get("is_pr", False)),
+            is_ugc=bool(parsed.get("is_ugc", False)),
+            tags=tags,
+            no_text_detected=bool(parsed.get("no_text_detected", False)),
+        )
 
     def _call_lm_studio(self, image_url: str, prompt: str) -> tuple[str, float]:
         started_at = time.perf_counter()
@@ -518,24 +522,26 @@ class OCRWorker:
         elapsed_sec = time.perf_counter() - started_at
         return raw_text, elapsed_sec
 
-    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str) -> tuple[str, str, str, bool, bool]:
+    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str) -> OCRResult:
         raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt)
-        text, background, profile_estimate, is_pr, no_text_detected = self._parse_lm_studio_response(raw_text)
+        result = self._parse_lm_studio_response(raw_text)
         logger.info(
             "OCR complete elapsed=%.2fs result=%s",
             elapsed_sec,
             json.dumps(
                 {
-                    "text": truncate_for_log(text),
-                    "background": truncate_for_log(background, limit=300),
-                    "profile_estimate": truncate_for_log(profile_estimate, limit=300),
-                    "is_pr": is_pr,
-                    "no_text_detected": no_text_detected,
+                    "text": truncate_for_log(result.text),
+                    "background": truncate_for_log(result.background, limit=300),
+                    "profile_estimate": truncate_for_log(result.profile_estimate, limit=300),
+                    "is_pr": result.is_pr,
+                    "is_ugc": result.is_ugc,
+                    "tags": result.tags,
+                    "no_text_detected": result.no_text_detected,
                 },
                 ensure_ascii=False,
             ),
         )
-        return text, background, profile_estimate, is_pr, no_text_detected
+        return result
 
     def run_test_mode(self, limit: int) -> int:
         payload = self.fetch_latest_media()
@@ -578,65 +584,33 @@ class OCRWorker:
             logger.info("--- raw response (elapsed=%.2fs) ---\n%s", elapsed_sec, raw_text)
 
             try:
-                text, background, profile_estimate, is_pr, no_text_detected = self._parse_lm_studio_response(raw_text)
+                result = self._parse_lm_studio_response(raw_text)
             except ValueError as exc:
                 logger.error("Failed to parse LM Studio response pk=%s error=%s", pk, exc)
                 continue
 
-            logger.info("--- parsed text ---\n%s", text)
-            logger.info("--- parsed background ---\n%s", background)
-            logger.info("--- parsed profile_estimate ---\n%s", profile_estimate)
-            logger.info("is_pr=%s  no_text_detected=%s", is_pr, no_text_detected)
+            logger.info("--- parsed text ---\n%s", result.text)
+            logger.info("--- parsed background ---\n%s", result.background)
+            logger.info("--- parsed profile_estimate ---\n%s", result.profile_estimate)
+            logger.info("--- parsed tags ---\n%s", json.dumps(result.tags, ensure_ascii=False))
+            logger.info(
+                "is_pr=%s  is_ugc=%s  no_text_detected=%s",
+                result.is_pr,
+                result.is_ugc,
+                result.no_text_detected,
+            )
 
         logger.info("=" * 80)
         logger.info("Test mode complete.")
         return 0
 
-    def run_lm_studio_ocr(self, image_url: str) -> tuple[str, str, str, bool, bool]:
-        last_exc: Exception | None = None
-
-        for attempt in range(1, self.config.ocr_retry_count + 1):
-            prompt = self.config.lm_studio_prompt if attempt == 1 else FALLBACK_PROMPT
-            try:
-                text, background, profile_estimate, is_pr, no_text_detected = self._run_lm_studio_ocr_once(
-                    image_url,
-                    prompt,
-                )
-            except (requests.RequestException, ValueError) as exc:
-                last_exc = exc
-                logger.warning(
-                    "OCR attempt failed attempt=%s/%s image=%s prompt_mode=%s error=%s",
-                    attempt,
-                    self.config.ocr_retry_count,
-                    image_url,
-                    "full" if attempt == 1 else "fallback",
-                    exc,
-                )
-            else:
-                if attempt > 1 and not background:
-                    background = ""
-                if attempt > 1 and not profile_estimate:
-                    profile_estimate = ""
-                if no_text_detected:
-                    return text, background, profile_estimate, is_pr, True
-                if text.strip():
-                    return text, background, profile_estimate, is_pr, False
-
-                last_exc = ValueError("LM Studio returned empty text without no_text_detected=true")
-                logger.warning(
-                    "OCR returned empty text without no_text_detected flag attempt=%s/%s image=%s prompt_mode=%s",
-                    attempt,
-                    self.config.ocr_retry_count,
-                    image_url,
-                    "full" if attempt == 1 else "fallback",
-                )
-
-            if attempt < self.config.ocr_retry_count:
-                time.sleep(self.config.ocr_retry_backoff_sec * attempt)
-
-        if last_exc is None:
-            raise RuntimeError(f"OCR failed without exception: {image_url}")
-        raise last_exc
+    def run_lm_studio_ocr(self, image_url: str) -> OCRResult:
+        result = self._run_lm_studio_ocr_once(image_url, self.config.lm_studio_prompt)
+        if not result.no_text_detected and not result.text.strip():
+            raise ValueError(
+                f"LM Studio returned empty text without no_text_detected=true: {image_url}"
+            )
+        return result
 
     def _needs_processing(self, item: dict[str, Any]) -> bool:
         ocr = item.get("ocr")
@@ -668,7 +642,7 @@ class OCRWorker:
         )
 
         try:
-            text, background, profile_estimate, is_pr, no_text_detected = self.run_lm_studio_ocr(full_image_url)
+            result = self.run_lm_studio_ocr(full_image_url)
         except (requests.RequestException, ValueError):
             if self.dashboard_state is not None:
                 self.dashboard_state.increment_failed()
@@ -676,23 +650,9 @@ class OCRWorker:
             logger.exception("OCR failed pk=%s image=%s", pk, full_image_url)
             return False
 
-        if not text.strip():
-            text = " "
-        if not background.strip():
-            background = " "
-        if not profile_estimate.strip():
-            profile_estimate = " "
-
         with self._write_lock:
             try:
-                self.post_ocr_result(
-                    pk,
-                    text,
-                    background,
-                    profile_estimate,
-                    is_pr,
-                    no_text_detected,
-                )
+                self.post_ocr_result(pk, result)
             except requests.RequestException as exc:
                 if self.dashboard_state is not None:
                     self.dashboard_state.increment_failed()
@@ -710,12 +670,13 @@ class OCRWorker:
                 self.dashboard_state.increment_processed()
                 self.dashboard_state.clear_current_item()
             logger.info(
-                "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s no_text_detected=%s",
+                "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s is_ugc=%s no_text_detected=%s",
                 pk,
                 taken_at,
                 format_taken_at(taken_at),
-                is_pr,
-                no_text_detected,
+                result.is_pr,
+                result.is_ugc,
+                result.no_text_detected,
             )
             time.sleep(self.config.write_interval_sec)
         return True
