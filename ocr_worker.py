@@ -57,7 +57,16 @@ Also provide profile_estimate in Japanese as a free-form estimate of the poster/
 If the image truly contains no readable text, set no_text_detected=true.
 Set no_text_detected=false whenever there is any readable text, even if partial.
 
-Return only valid JSON in exactly this shape:
+Output format rules (MANDATORY):
+- Return ONLY the raw JSON object. Output MUST start with `{` and end with `}`.
+- Do NOT wrap the JSON in markdown code fences. No triple backticks, no `json` language tag.
+- Do NOT add any prose, explanation, label, or commentary before or after the JSON.
+- NEVER write the backslash character `\\` anywhere in any JSON string value. Backslash is forbidden in your output.
+- For line breaks inside any string value, write the literal token `<br>` instead of `\\n` or a real newline.
+- If the image contains a decorative leading slash (e.g. `\\テキスト/`, `\\待ってました/`), write the leading slash as the literal token `<bs>` instead of `\\`. Example: a decoration shown as `\\待ってました/` in the image must be written as `<bs>待ってました/` in the JSON.
+- Never insert raw newlines or other control characters inside JSON string values.
+
+JSON shape:
 {"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"is_ugc":true,"tags":["tag1","tag2"],"no_text_detected":false}"""
 
 
@@ -270,6 +279,16 @@ def truncate_for_log(text: str, limit: int = 500) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[:limit]}... (truncated, total={len(normalized)} chars)"
+
+
+def restore_placeholders(text: str) -> str:
+    """プロンプトで VLM に書かせた `<br>` / `<bs>` を改行 / バックスラッシュに戻す。
+
+    Gemma 4 e4b の json_schema が機能せず、文字列値内に raw `\\` を含む不正 JSON が
+    返ってくるのを回避するため、プロンプト側で `\\` を出力させずプレースホルダで
+    書かせている。Python 側で本来の文字に戻す。
+    """
+    return text.replace("<br>", "\n").replace("<bs>", "\\")
 
 
 def response_body_for_log(response: requests.Response | None, limit: int = 1000) -> str:
@@ -617,6 +636,13 @@ class OCRWorker:
 
     def _parse_lm_studio_response(self, response_text: str) -> OCRResult:
         raw = response_text.strip()
+        # Gemma 4 等が schema を無視して ```json ... ``` で包んでくるケースを剥がす。
+        if raw.startswith("```"):
+            first_newline = raw.find("\n")
+            if first_newline != -1:
+                raw = raw[first_newline + 1 :].rstrip()
+            if raw.endswith("```"):
+                raw = raw[:-3].rstrip()
 
         try:
             parsed = json.loads(raw)
@@ -647,14 +673,14 @@ class OCRWorker:
 
         raw_tags = parsed.get("tags", [])
         if isinstance(raw_tags, list):
-            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+            tags = [restore_placeholders(str(t)).strip() for t in raw_tags if str(t).strip()]
         else:
             tags = []
 
         return OCRResult(
-            text=str(parsed.get("text", "")).strip(),
-            background=str(parsed.get("background", "")).strip(),
-            profile_estimate=str(parsed.get("profile_estimate", "")).strip(),
+            text=restore_placeholders(str(parsed.get("text", ""))).strip(),
+            background=restore_placeholders(str(parsed.get("background", ""))).strip(),
+            profile_estimate=restore_placeholders(str(parsed.get("profile_estimate", ""))).strip(),
             is_pr=bool(parsed.get("is_pr", False)),
             is_ugc=bool(parsed.get("is_ugc", False)),
             tags=tags,
