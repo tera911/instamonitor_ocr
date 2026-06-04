@@ -1,0 +1,12 @@
+# LM Studio エンドポイント定義
+# OCR_ENDPOINTS_FILE 環境変数でパスを指定する (未設定時は endpoints.toml をカレントから探す)
+# url: LM Studio (OpenAI 互換) の chat/completions エンドポイント
+# concurrency: そのエンドポイントに同時投げ込む数 (GPU/VRAM に合わせて調整)
+
+[[endpoints]]
+url = "http://machine-a:1234/v1/chat/completions"
+concurrency = 4
+
+[[endpoints]]
+url = "http://machine-b:1234/v1/chat/completions"
+concurrency = 2

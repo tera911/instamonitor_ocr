@@ -3,15 +3,16 @@ from __future__ import annotations
 import argparse
 import base64
 import curses
-import hashlib
 import json
 import logging
+import logging.handlers
 import os
+import queue
 import sys
 import threading
 import time
+import tomllib
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -58,6 +59,42 @@ Set no_text_detected=false whenever there is any readable text, even if partial.
 
 Return only valid JSON in exactly this shape:
 {"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"is_ugc":true,"tags":["tag1","tag2"],"no_text_detected":false}"""
+
+
+# LM Studio Structured Outputs (0.3.0+) で出力 JSON を文法的に強制する。
+# constrained sampling により \ の未エスケープ等の不正 JSON が物理的に出なくなる。
+# maxLength / maxItems は GBNF grammar に量化子として落ちて、ループ系の暴走で
+# 出力が肥大化するのを構文レベルで止める (推論時間そのものは max_tokens で切る)。
+OCR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "name": "ocr_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "maxLength": 8000},
+            "background": {"type": "string", "maxLength": 1000},
+            "profile_estimate": {"type": "string", "maxLength": 1000},
+            "is_pr": {"type": "boolean"},
+            "is_ugc": {"type": "boolean"},
+            "tags": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {"type": "string", "maxLength": 64},
+            },
+            "no_text_detected": {"type": "boolean"},
+        },
+        "required": [
+            "text",
+            "background",
+            "profile_estimate",
+            "is_pr",
+            "is_ugc",
+            "tags",
+            "no_text_detected",
+        ],
+        "additionalProperties": False,
+    },
+}
 
 
 logging.basicConfig(
@@ -175,6 +212,59 @@ def load_dotenv_file(path: Path) -> None:
         os.environ[key] = value
 
 
+def _is_console_handler(handler: logging.Handler) -> bool:
+    """stdout / stderr に直結している StreamHandler を判定する。
+
+    FileHandler は StreamHandler を継承しているため、単純な isinstance だと
+    file handler まで除外されてしまう。stream 属性で sys.stdout / stderr を
+    狙い撃ちすることでファイル系ハンドラを温存する。"""
+    if not isinstance(handler, logging.StreamHandler) or isinstance(handler, logging.FileHandler):
+        return False
+    return getattr(handler, "stream", None) in (sys.stdout, sys.stderr)
+
+
+def setup_file_logging() -> Path | None:
+    raw_path = os.getenv("OCR_LOG_FILE", "").strip()
+    if not raw_path:
+        return None
+
+    log_path = Path(raw_path).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = max(1024, int(os.getenv("OCR_LOG_MAX_BYTES", str(10 * 1024 * 1024))))
+    backup_count = max(1, int(os.getenv("OCR_LOG_BACKUP_COUNT", "5")))
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    level_name = os.getenv("OCR_LOG_FILE_LEVEL", "").strip().upper()
+    if level_name:
+        level_value = logging.getLevelName(level_name)
+        if isinstance(level_value, int):
+            file_handler.setLevel(level_value)
+        else:
+            logger.warning(
+                "Unknown OCR_LOG_FILE_LEVEL=%s; falling back to logger level.",
+                level_name,
+            )
+
+    # `ocr_worker` logger 自身に付ける。dashboard モードで propagate=False にしても
+    # ファイル出力が止まらないようにするため。
+    logger.addHandler(file_handler)
+    logger.info(
+        "File logging enabled path=%s maxBytes=%s backupCount=%s level=%s",
+        log_path,
+        max_bytes,
+        backup_count,
+        logging.getLevelName(file_handler.level) if file_handler.level else "inherit",
+    )
+    return log_path
+
+
 def truncate_for_log(text: str, limit: int = 500) -> str:
     normalized = text.replace("\r\n", "\n").strip()
     if len(normalized) <= limit:
@@ -238,15 +328,20 @@ class OCRResult:
     no_text_detected: bool
 
 
+@dataclass(frozen=True)
+class Endpoint:
+    url: str
+    concurrency: int
+
+
 @dataclass
 class Config:
     api_base_url: str
     image_host_prefix: str
     image_local_root: Path | None
     api_key: str
-    include_done: bool
     ocr_version: str
-    lm_studio_url: str
+    endpoints: list[Endpoint]
     lm_studio_model: str
     lm_studio_prompt: str
     lm_studio_api_key: str
@@ -254,22 +349,21 @@ class Config:
     write_interval_sec: float
     request_timeout_sec: int
     lm_studio_timeout_sec: int
+    lm_studio_max_tokens: int
     request_retry_count: int
     request_retry_backoff_sec: float
     image_max_dim: int
     page_size: int
-    max_items_per_cycle: int
-    concurrency: int
-    shard_count: int
-    shard_index: int
+
+    @property
+    def total_concurrency(self) -> int:
+        return sum(ep.concurrency for ep in self.endpoints)
 
     @classmethod
     def from_env(cls) -> "Config":
         api_base_url = os.getenv("OCR_API_BASE_URL", "").strip().rstrip("/")
         image_host_prefix = os.getenv("OCR_IMAGE_HOST_PREFIX", "").strip().rstrip("/")
         api_key = os.getenv("OCR_API_KEY", "").strip()
-        shard_count = max(1, int(os.getenv("OCR_SHARD_COUNT", "1")))
-        shard_index = int(os.getenv("OCR_SHARD_INDEX", "0"))
 
         if not api_base_url:
             raise ValueError("OCR_API_BASE_URL is required.")
@@ -277,8 +371,9 @@ class Config:
             raise ValueError("OCR_IMAGE_HOST_PREFIX is required.")
         if not api_key:
             raise ValueError("OCR_API_KEY is required.")
-        if shard_index < 0 or shard_index >= shard_count:
-            raise ValueError("OCR_SHARD_INDEX must be greater than or equal to 0 and less than OCR_SHARD_COUNT.")
+
+        endpoints_path = Path(os.getenv("OCR_ENDPOINTS_FILE", "endpoints.toml")).expanduser()
+        endpoints = load_endpoints(endpoints_path)
 
         local_root_raw = os.getenv("OCR_IMAGE_LOCAL_ROOT", "").strip()
         image_local_root: Path | None = None
@@ -298,12 +393,8 @@ class Config:
             image_host_prefix=image_host_prefix,
             image_local_root=image_local_root,
             api_key=api_key,
-            include_done=os.getenv("OCR_INCLUDE_DONE", "0").strip() in {"1", "true", "yes", "on"},
             ocr_version=os.getenv("OCR_VERSION", "2026-05-31").strip(),
-            lm_studio_url=os.getenv(
-                "LM_STUDIO_API_URL",
-                "http://127.0.0.1:1234/v1/chat/completions",
-            ).strip(),
+            endpoints=endpoints,
             lm_studio_model=os.getenv("LM_STUDIO_MODEL", "gemma-3-27b-it").strip(),
             lm_studio_prompt=os.getenv("LM_STUDIO_OCR_PROMPT", DEFAULT_PROMPT).strip(),
             lm_studio_api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio").strip(),
@@ -311,15 +402,48 @@ class Config:
             write_interval_sec=float(os.getenv("WRITE_INTERVAL_SEC", "1.0")),
             request_timeout_sec=int(os.getenv("REQUEST_TIMEOUT_SEC", "30")),
             lm_studio_timeout_sec=int(os.getenv("LM_STUDIO_TIMEOUT_SEC", "180")),
+            lm_studio_max_tokens=max(64, int(os.getenv("LM_STUDIO_MAX_TOKENS", "4096"))),
             request_retry_count=max(1, int(os.getenv("REQUEST_RETRY_COUNT", "3"))),
             request_retry_backoff_sec=float(os.getenv("REQUEST_RETRY_BACKOFF_SEC", "2.0")),
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1280"))),
-            page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "100")))),
-            max_items_per_cycle=max(1, int(os.getenv("MAX_ITEMS_PER_CYCLE", "50"))),
-            concurrency=max(1, int(os.getenv("OCR_CONCURRENCY", "1"))),
-            shard_count=shard_count,
-            shard_index=shard_index,
+            page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "50")))),
         )
+
+
+def load_endpoints(path: Path) -> list[Endpoint]:
+    if not path.is_file():
+        raise ValueError(
+            f"Endpoints file not found: {path}. "
+            "Set OCR_ENDPOINTS_FILE or place endpoints.toml in the working directory."
+        )
+
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+
+    rows = raw.get("endpoints", [])
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{path}: [[endpoints]] must contain at least one entry.")
+
+    endpoints: list[Endpoint] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}: endpoints[{index}] must be a table.")
+        url = str(row.get("url", "")).strip()
+        if not url:
+            raise ValueError(f"{path}: endpoints[{index}].url is required.")
+        concurrency_raw = row.get("concurrency", 1)
+        try:
+            concurrency = int(concurrency_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{path}: endpoints[{index}].concurrency must be a positive integer."
+            ) from exc
+        if concurrency < 1:
+            raise ValueError(
+                f"{path}: endpoints[{index}].concurrency must be a positive integer."
+            )
+        endpoints.append(Endpoint(url=url, concurrency=concurrency))
+    return endpoints
 
 
 class OCRWorker:
@@ -371,20 +495,19 @@ class OCRWorker:
             raise RuntimeError(f"Request failed without exception: {method} {url}")
         raise last_exc
 
-    def fetch_latest_media(self, before_taken_at: int | None = None) -> dict[str, Any]:
-        params: dict[str, Any] = {"limit": self.config.page_size}
-        if before_taken_at is not None:
-            params["before_taken_at"] = before_taken_at
-        if self.config.include_done:
-            params["include_done"] = 1
-
+    def fetch_latest_media(self) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "limit": self.config.page_size,
+            "current_version": self.config.ocr_version,
+        }
         response = self._request_with_retry(
             "GET",
             f"{self.config.api_base_url}/media/latest",
             params=params,
             timeout=self.config.request_timeout_sec,
         )
-        return response.json()
+        payload = response.json()
+        return list(payload.get("data", []))
 
     def post_ocr_result(self, pk: str, result: OCRResult) -> None:
         payload = {
@@ -524,7 +647,7 @@ class OCRWorker:
             no_text_detected=bool(parsed.get("no_text_detected", False)),
         )
 
-    def _call_lm_studio(self, image_url: str, prompt: str) -> tuple[str, float]:
+    def _call_lm_studio(self, image_url: str, prompt: str, endpoint_url: str) -> tuple[str, float]:
         started_at = time.perf_counter()
         image_b64 = self._download_image_as_base64(image_url)
         payload = {
@@ -544,10 +667,15 @@ class OCRWorker:
                 }
             ],
             "temperature": 0.0,
+            "max_tokens": self.config.lm_studio_max_tokens,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": OCR_RESPONSE_SCHEMA,
+            },
         }
 
         response = requests.post(
-            self.config.lm_studio_url,
+            endpoint_url,
             headers={
                 "Authorization": f"Bearer {self.config.lm_studio_api_key}",
                 "Content-Type": "application/json",
@@ -559,7 +687,8 @@ class OCRWorker:
             response.raise_for_status()
         except requests.HTTPError as exc:
             logger.error(
-                "LM Studio request failed status=%s body=%s",
+                "LM Studio request failed endpoint=%s status=%s body=%s",
+                endpoint_url,
                 response.status_code,
                 response_body_for_log(response),
             )
@@ -573,11 +702,12 @@ class OCRWorker:
         elapsed_sec = time.perf_counter() - started_at
         return raw_text, elapsed_sec
 
-    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str) -> OCRResult:
-        raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt)
+    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str, endpoint_url: str) -> OCRResult:
+        raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt, endpoint_url)
         result = self._parse_lm_studio_response(raw_text)
         logger.info(
-            "OCR complete elapsed=%.2fs result=%s",
+            "OCR complete endpoint=%s elapsed=%.2fs result=%s",
+            endpoint_url,
             elapsed_sec,
             json.dumps(
                 {
@@ -595,12 +725,11 @@ class OCRWorker:
         return result
 
     def run_test_mode(self, limit: int) -> int:
-        payload = self.fetch_latest_media()
-        items = payload.get("data", [])[:limit]
+        items = self.fetch_latest_media()[:limit]
         if not items:
             logger.warning(
                 "No items returned from /media/latest. "
-                "Set OCR_INCLUDE_DONE=1 to also include already-OCR'd items.",
+                "Bump OCR_VERSION to also re-OCR previously processed posts."
             )
             return 0
 
@@ -610,6 +739,7 @@ class OCRWorker:
         )
         logger.info("Prompt in use:\n%s", self.config.lm_studio_prompt)
 
+        endpoint_url = self.config.endpoints[0].url
         for index, item in enumerate(items, start=1):
             pk = str(item["pk"])
             taken_at = int(item["taken_at"])
@@ -617,17 +747,20 @@ class OCRWorker:
 
             logger.info("=" * 80)
             logger.info(
-                "[%s/%s] pk=%s taken_at=%s (%s) image=%s",
+                "[%s/%s] pk=%s taken_at=%s (%s) endpoint=%s image=%s",
                 index,
                 len(items),
                 pk,
                 taken_at,
                 format_taken_at(taken_at),
+                endpoint_url,
                 image_url,
             )
 
             try:
-                raw_text, elapsed_sec = self._call_lm_studio(image_url, self.config.lm_studio_prompt)
+                raw_text, elapsed_sec = self._call_lm_studio(
+                    image_url, self.config.lm_studio_prompt, endpoint_url
+                )
             except (requests.RequestException, ValueError):
                 logger.exception("LM Studio call failed pk=%s", pk)
                 continue
@@ -655,50 +788,55 @@ class OCRWorker:
         logger.info("Test mode complete.")
         return 0
 
-    def run_lm_studio_ocr(self, image_url: str) -> OCRResult:
-        result = self._run_lm_studio_ocr_once(image_url, self.config.lm_studio_prompt)
-        if not result.no_text_detected and not result.text.strip():
-            raise ValueError(
-                f"LM Studio returned empty text without no_text_detected=true: {image_url}"
+    def run_lm_studio_ocr(self, image_url: str, endpoint_url: str) -> OCRResult:
+        result = self._run_lm_studio_ocr_once(image_url, self.config.lm_studio_prompt, endpoint_url)
+        if not result.text.strip() and not result.no_text_detected:
+            # 文字を含まない投稿 (写真のみ等) は普通にあり得る。text 空 + no_text_detected=false
+            # で返ってきた場合は「読めなかった = テキストなし」として保存する。background /
+            # tags / is_ugc などの他フィールドは Structured Outputs で型保証されているので
+            # そのまま活かす。
+            logger.info(
+                "Empty text returned; recording as no_text_detected=true url=%s",
+                image_url,
+            )
+            result = OCRResult(
+                text=result.text,
+                background=result.background,
+                profile_estimate=result.profile_estimate,
+                is_pr=result.is_pr,
+                is_ugc=result.is_ugc,
+                tags=result.tags,
+                no_text_detected=True,
             )
         return result
 
-    def _needs_processing(self, item: dict[str, Any]) -> bool:
-        ocr = item.get("ocr")
-        if ocr is None:
-            return True
-        if not isinstance(ocr, dict):
-            return True
-        return str(ocr.get("version", "")).strip() != self.config.ocr_version
-
-    def _is_assigned_to_this_shard(self, pk: str) -> bool:
-        if self.config.shard_count == 1:
-            return True
-        digest = hashlib.sha256(pk.encode("utf-8")).digest()
-        shard = int.from_bytes(digest[:8], byteorder="big") % self.config.shard_count
-        return shard == self.config.shard_index
-
-    def _process_media_item(self, item: dict[str, Any]) -> bool:
+    def _process_media_item(self, item: dict[str, Any], endpoint_url: str) -> bool:
         pk = str(item["pk"])
         taken_at = int(item["taken_at"])
         full_image_url = self._build_image_url(str(item["image_url"]))
         if self.dashboard_state is not None:
             self.dashboard_state.set_current_item(pk, taken_at, format_taken_at(taken_at))
         logger.info(
-            "Processing pk=%s taken_at=%s (%s) image=%s",
+            "Processing pk=%s taken_at=%s (%s) endpoint=%s image=%s",
             pk,
             taken_at,
             format_taken_at(taken_at),
+            endpoint_url,
             full_image_url,
         )
 
         try:
-            result = self.run_lm_studio_ocr(full_image_url)
+            result = self.run_lm_studio_ocr(full_image_url, endpoint_url)
         except (requests.RequestException, ValueError):
             if self.dashboard_state is not None:
                 self.dashboard_state.increment_failed()
                 self.dashboard_state.clear_current_item()
-            logger.exception("OCR failed pk=%s image=%s", pk, full_image_url)
+            logger.exception(
+                "OCR failed pk=%s endpoint=%s image=%s",
+                pk,
+                endpoint_url,
+                full_image_url,
+            )
             return False
 
         with self._write_lock:
@@ -735,105 +873,81 @@ class OCRWorker:
     def _process_media_batch(self, items: list[dict[str, Any]]) -> int:
         if not items:
             return 0
-        if self.config.concurrency == 1 or len(items) == 1:
-            return sum(1 for item in items if self._process_media_item(item))
 
-        processed_count = 0
-        worker_count = min(self.config.concurrency, len(items))
+        item_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        for item in items:
+            item_queue.put(item)
+
+        counter_lock = threading.Lock()
+        processed_total = 0
+
+        endpoints = self.config.endpoints
+        total_workers = self.config.total_concurrency
         logger.info(
-            "Processing batch items=%s concurrency=%s",
+            "Processing batch items=%s endpoints=%s workers=%s breakdown=%s",
             len(items),
-            worker_count,
+            len(endpoints),
+            total_workers,
+            ", ".join(f"{ep.url}={ep.concurrency}" for ep in endpoints),
         )
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(self._process_media_item, item) for item in items]
-            for future in as_completed(futures):
+
+        def run_worker(endpoint_url: str) -> None:
+            nonlocal processed_total
+            while True:
                 try:
-                    succeeded = future.result()
+                    item = item_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    succeeded = self._process_media_item(item, endpoint_url)
                 except Exception:
                     if self.dashboard_state is not None:
                         self.dashboard_state.increment_failed()
                     logger.exception("Unexpected error while processing OCR batch item")
-                    continue
+                    succeeded = False
+                finally:
+                    item_queue.task_done()
                 if succeeded:
-                    processed_count += 1
-        return processed_count
+                    with counter_lock:
+                        processed_total += 1
+
+        threads: list[threading.Thread] = []
+        for ep in endpoints:
+            for slot in range(ep.concurrency):
+                thread = threading.Thread(
+                    target=run_worker,
+                    args=(ep.url,),
+                    name=f"ocr-worker[{ep.url}#{slot}]",
+                    daemon=True,
+                )
+                thread.start()
+                threads.append(thread)
+
+        for thread in threads:
+            thread.join()
+
+        return processed_total
 
     def process_cycle(self) -> dict[str, int]:
-        processed_count = 0
-        skipped_count = 0
-        page_count = 0
-        before_taken_at: int | None = None
-        should_stop = False
-
-        while True:
-            page_count += 1
-            payload = self.fetch_latest_media(before_taken_at=before_taken_at)
-            media_list = payload.get("data", [])
-            next_before_taken_at = payload.get("next_before_taken_at")
-
-            if not media_list:
-                break
-
-            batch: list[dict[str, Any]] = []
-            for item in media_list:
-                pk = str(item["pk"])
-
-                if not self._is_assigned_to_this_shard(pk):
-                    skipped_count += 1
-                    if self.dashboard_state is not None:
-                        self.dashboard_state.increment_skipped()
-                    logger.info(
-                        "Skipping post assigned to another shard pk=%s shard_index=%s shard_count=%s",
-                        pk,
-                        self.config.shard_index,
-                        self.config.shard_count,
-                    )
-                    continue
-
-                if not self._needs_processing(item):
-                    skipped_count += 1
-                    if self.dashboard_state is not None:
-                        self.dashboard_state.increment_skipped()
-                    logger.info(
-                        "Skipping already OCR'd post pk=%s version=%s",
-                        pk,
-                        self.config.ocr_version,
-                    )
-                    continue
-
-                if processed_count + len(batch) >= self.config.max_items_per_cycle:
-                    logger.info(
-                        "Reached cycle limit processed=%s queued=%s max_items_per_cycle=%s",
-                        processed_count,
-                        len(batch),
-                        self.config.max_items_per_cycle,
-                    )
-                    should_stop = True
-                    break
-
-                batch.append(item)
-
-            processed_count += self._process_media_batch(batch)
-
-            if should_stop or next_before_taken_at is None:
-                break
-
-            before_taken_at = int(next_before_taken_at)
-
+        items = self.fetch_latest_media()
+        processed_count = self._process_media_batch(items) if items else 0
         return {
-            "pages": page_count,
+            "pages": 1,
             "processed": processed_count,
-            "skipped": skipped_count,
+            "skipped": 0,
         }
 
     def run_forever(self) -> None:
+        breakdown = ", ".join(
+            f"{ep.url}={ep.concurrency}" for ep in self.config.endpoints
+        )
         logger.info(
-            "Starting OCR worker with model=%s concurrency=%s shard_index=%s shard_count=%s",
+            "Starting OCR worker model=%s ocr_version=%s endpoints=%s total_workers=%s breakdown=%s",
             self.config.lm_studio_model,
-            self.config.concurrency,
-            self.config.shard_index,
-            self.config.shard_count,
+            self.config.ocr_version,
+            len(self.config.endpoints),
+            self.config.total_concurrency,
+            breakdown,
         )
 
         while True:
@@ -1024,6 +1138,8 @@ def main() -> int:
     args = parse_args()
     load_dotenv_file(Path(".env"))
 
+    setup_file_logging()
+
     try:
         config = Config.from_env()
     except ValueError as exc:
@@ -1050,15 +1166,15 @@ def main() -> int:
     dashboard_state = DashboardState()
     root_logger = logging.getLogger()
     for handler in list(root_logger.handlers):
-        if isinstance(handler, logging.StreamHandler):
+        if _is_console_handler(handler):
             root_logger.removeHandler(handler)
     for handler in list(logger.handlers):
-        if isinstance(handler, logging.StreamHandler):
+        if _is_console_handler(handler):
             logger.removeHandler(handler)
     logger.propagate = False
-    handler = DashboardLogHandler(dashboard_state)
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.addHandler(handler)
+    dashboard_handler = DashboardLogHandler(dashboard_state)
+    dashboard_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(dashboard_handler)
 
     worker = OCRWorker(config, dashboard_state=dashboard_state)
     return run_with_dashboard(worker, dashboard_state)
