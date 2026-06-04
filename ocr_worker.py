@@ -346,7 +346,6 @@ class Config:
     lm_studio_prompt: str
     lm_studio_api_key: str
     idle_sleep_sec: float
-    write_interval_sec: float
     request_timeout_sec: int
     lm_studio_timeout_sec: int
     lm_studio_max_tokens: int
@@ -399,7 +398,6 @@ class Config:
             lm_studio_prompt=os.getenv("LM_STUDIO_OCR_PROMPT", DEFAULT_PROMPT).strip(),
             lm_studio_api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio").strip(),
             idle_sleep_sec=float(os.getenv("IDLE_SLEEP_SEC", "60.0")),
-            write_interval_sec=float(os.getenv("WRITE_INTERVAL_SEC", "1.0")),
             request_timeout_sec=int(os.getenv("REQUEST_TIMEOUT_SEC", "30")),
             lm_studio_timeout_sec=int(os.getenv("LM_STUDIO_TIMEOUT_SEC", "180")),
             lm_studio_max_tokens=max(64, int(os.getenv("LM_STUDIO_MAX_TOKENS", "4096"))),
@@ -450,7 +448,8 @@ class OCRWorker:
     def __init__(self, config: Config, dashboard_state: DashboardState | None = None):
         self.config = config
         self.dashboard_state = dashboard_state
-        self._write_lock = threading.Lock()
+        self._failed_pks_lock = threading.Lock()
+        self._failed_pks: set[str] = set()
 
     def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         last_exc: requests.RequestException | None = None
@@ -621,12 +620,27 @@ class OCRWorker:
 
         try:
             parsed = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             start = raw.find("{")
             end = raw.rfind("}")
             if start == -1 or end == -1 or end <= start:
+                logger.error(
+                    "LM Studio response has no JSON object error=%s\n--- raw response ---\n%s\n--- end ---",
+                    exc,
+                    raw,
+                )
                 raise ValueError(f"LM Studio did not return JSON: {truncate_for_log(raw)}")
-            parsed = json.loads(raw[start : end + 1])
+            candidate = raw[start : end + 1]
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError as inner_exc:
+                logger.error(
+                    "LM Studio response JSON parse failed error=%s\n--- raw response ---\n%s\n--- extracted candidate ---\n%s\n--- end ---",
+                    inner_exc,
+                    raw,
+                    candidate,
+                )
+                raise
 
         if not isinstance(parsed, dict):
             raise ValueError(f"LM Studio returned non-object JSON: {truncate_for_log(raw)}")
@@ -812,6 +826,12 @@ class OCRWorker:
 
     def _process_media_item(self, item: dict[str, Any], endpoint_url: str) -> bool:
         pk = str(item["pk"])
+
+        with self._failed_pks_lock:
+            if pk in self._failed_pks:
+                logger.debug("Skipping previously failed pk=%s", pk)
+                return False
+
         taken_at = int(item["taken_at"])
         full_image_url = self._build_image_url(str(item["image_url"]))
         if self.dashboard_state is not None:
@@ -828,6 +848,8 @@ class OCRWorker:
         try:
             result = self.run_lm_studio_ocr(full_image_url, endpoint_url)
         except (requests.RequestException, ValueError):
+            with self._failed_pks_lock:
+                self._failed_pks.add(pk)
             if self.dashboard_state is not None:
                 self.dashboard_state.increment_failed()
                 self.dashboard_state.clear_current_item()
@@ -839,35 +861,33 @@ class OCRWorker:
             )
             return False
 
-        with self._write_lock:
-            try:
-                self.post_ocr_result(pk, result)
-            except requests.RequestException as exc:
-                if self.dashboard_state is not None:
-                    self.dashboard_state.increment_failed()
-                    self.dashboard_state.clear_current_item()
-                status = exc.response.status_code if exc.response is not None else "unknown"
-                logger.error(
-                    "POST failed pk=%s status=%s body=%s",
-                    pk,
-                    status,
-                    response_body_for_log(exc.response),
-                )
-                return False
-
+        try:
+            self.post_ocr_result(pk, result)
+        except requests.RequestException as exc:
             if self.dashboard_state is not None:
-                self.dashboard_state.increment_processed()
+                self.dashboard_state.increment_failed()
                 self.dashboard_state.clear_current_item()
-            logger.info(
-                "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s is_ugc=%s no_text_detected=%s",
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            logger.error(
+                "POST failed pk=%s status=%s body=%s",
                 pk,
-                taken_at,
-                format_taken_at(taken_at),
-                result.is_pr,
-                result.is_ugc,
-                result.no_text_detected,
+                status,
+                response_body_for_log(exc.response),
             )
-            time.sleep(self.config.write_interval_sec)
+            return False
+
+        if self.dashboard_state is not None:
+            self.dashboard_state.increment_processed()
+            self.dashboard_state.clear_current_item()
+        logger.info(
+            "Posted OCR result pk=%s taken_at=%s (%s) is_pr=%s is_ugc=%s no_text_detected=%s",
+            pk,
+            taken_at,
+            format_taken_at(taken_at),
+            result.is_pr,
+            result.is_ugc,
+            result.no_text_detected,
+        )
         return True
 
     def _process_media_batch(self, items: list[dict[str, Any]]) -> int:
