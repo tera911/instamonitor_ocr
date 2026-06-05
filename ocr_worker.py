@@ -57,14 +57,13 @@ Also provide profile_estimate in Japanese as a free-form estimate of the poster/
 If the image truly contains no readable text, set no_text_detected=true.
 Set no_text_detected=false whenever there is any readable text, even if partial.
 
-Output format rules (MANDATORY):
+Output format rules (MANDATORY — these override visual fidelity):
 - Return ONLY the raw JSON object. Output MUST start with `{` and end with `}`.
 - Do NOT wrap the JSON in markdown code fences. No triple backticks, no `json` language tag.
 - Do NOT add any prose, explanation, label, or commentary before or after the JSON.
-- NEVER write the backslash character `\\` anywhere in any JSON string value. Backslash is forbidden in your output.
-- For line breaks inside any string value, write the literal token `<br>` instead of `\\n` or a real newline.
-- If the image contains a decorative leading slash (e.g. `\\テキスト/`, `\\待ってました/`), write the leading slash as the literal token `<bs>` instead of `\\`. Example: a decoration shown as `\\待ってました/` in the image must be written as `<bs>待ってました/` in the JSON.
-- Never insert raw newlines or other control characters inside JSON string values.
+- NEVER write the backslash character `\\` anywhere in any JSON string value. Backslash is forbidden in your output. If the image contains a decorative leading slash like `\\テキスト/`, write it as `<bs>テキスト/` instead. Example: `\\待ってました/` in the image MUST be written as `<bs>待ってました/`.
+- NEVER write the double-quote character `"` anywhere in any JSON string value. The only `"` characters allowed in your output are the ones that delimit JSON keys and values. If the image contains quoted text like `"With Me"` or `"いつも"`, write the quotes as the literal token `<dq>` instead. Example: `"With Me"` in the image MUST be written as `<dq>With Me<dq>`.
+- ABSOLUTELY NEVER insert a real newline character (LF) or any other control character inside a JSON string value. This is the most important rule. For every line break in the image, write the literal token `<br>` — six characters: `<`, `b`, `r`, `>`. Do NOT use `\\n`. Do NOT press enter. The entire JSON output must be a single physical line.
 
 JSON shape:
 {"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"is_ugc":true,"tags":["tag1","tag2"],"no_text_detected":false}"""
@@ -282,13 +281,13 @@ def truncate_for_log(text: str, limit: int = 500) -> str:
 
 
 def restore_placeholders(text: str) -> str:
-    """プロンプトで VLM に書かせた `<br>` / `<bs>` を改行 / バックスラッシュに戻す。
+    """プロンプトで VLM に書かせた `<br>` / `<bs>` / `<dq>` を改行 / バックスラッシュ / ダブルクォートに戻す。
 
-    Gemma 4 e4b の json_schema が機能せず、文字列値内に raw `\\` を含む不正 JSON が
-    返ってくるのを回避するため、プロンプト側で `\\` を出力させずプレースホルダで
-    書かせている。Python 側で本来の文字に戻す。
+    Gemma 4 e4b の json_schema が機能せず、文字列値内に raw `\\` や `"` や生改行を
+    含む不正 JSON が返ってくるのを回避するため、プロンプト側でそれらを出力させず
+    プレースホルダで書かせている。Python 側で本来の文字に戻す。
     """
-    return text.replace("<br>", "\n").replace("<bs>", "\\")
+    return text.replace("<br>", "\n").replace("<bs>", "\\").replace("<dq>", '"')
 
 
 def response_body_for_log(response: requests.Response | None, limit: int = 1000) -> str:
