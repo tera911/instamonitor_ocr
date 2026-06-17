@@ -104,7 +104,7 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 実際にモデルへ投げているプロンプトは `ocr_worker.py` 内に定数として置いてあります。プロンプトを変えたいときは下記を直接編集するか、`LM_STUDIO_OCR_PROMPT` 環境変数で `DEFAULT_PROMPT` を上書きしてください。
 
-- [`DEFAULT_PROMPT`](./ocr_worker.py#L30-L60) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
+- [`DEFAULT_PROMPT`](./ocr_worker.py#L32-L71) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
 
 旧 `FALLBACK_PROMPT` および OCR 自体の retry は廃止しています。LM Studio の返答が空 / 不正 JSON だった場合は即時失敗扱いとし、原因をログから追って prompt 側を直す方針です。
 
@@ -149,9 +149,9 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 | `enable_thinking` | false | false | thinking on は reasoning 暴走で content=null が出る・text が短縮される副作用、Speed も 3 倍遅 |
 | `concurrency` | 64 | 64 | vLLM の `--max-num-seqs` を超えなければ 96 / 128 まで余地あり (proxy 無しの本番想定) |
 | 期待 throughput | 〜7 req/s | 〜1.7 req/s | 100件×並列8の実測値ベース。本番並列ではスケール |
-| corruption (HTMLタグ等) | ほぼゼロ | `<br>` が約 25% で混入 | 12B は改行を `<br>` で表現する癖。post-processing で `\n` 化が有効 |
+| corruption (HTMLタグ等) | ほぼゼロ | raw では `<br>` が約 25% に混入 → **`normalize_model_text` で `\n` に正規化済み** | 12B は改行を `<br>` で表現する癖を持つが、parse 後の `OCRResult.text` 等には残らない |
 
-12B の `<br>` 癖は学習バイアスで、画像内の改行を表現する **正当な記号** です (情報損失なし)。気になる場合は下流で `<br>` → `\n` の正規化を入れてください。今のところワーカー側では正規化していません。
+12B の `<br>` 癖は学習バイアスで、画像内の改行を表現する **正当な記号** です (情報損失なし)。ワーカー側で `normalize_model_text` が `<br>` を `\n` に変換し、それ以外の HTML/XML タグ (`<p>`, `<hr>` の反復暴走パターンを含む) は中身だけ残して strip します。連続改行は `\n\n` まで圧縮されます。
 
 両ガードを重ねるのは、`max_tokens` だけだと壊れた途中で切れた JSON が返る可能性があるため。`maxLength` で構造的に閉じる、`frequency_penalty` で反復自体を止める、`max_tokens` で最終クリーンカット、という三段構えになっています。
 

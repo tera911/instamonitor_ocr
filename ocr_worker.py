@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -304,6 +305,29 @@ def setup_file_logging() -> Path | None:
         logging.getLevelName(file_handler.level) if file_handler.level else "inherit",
     )
     return log_path
+
+
+# Gemma 4 12B が画像内の改行を <br> で表現する癖と、稀に <hr>/<p> 等を反復生成する
+# 暴走への対策。<br> は改行情報として有意なので \n に変換、それ以外のタグは中身だけ
+# 残して strip する。
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_GENERIC_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(\s[^>]*)?/?>")
+_EXCESS_NEWLINE_RE = re.compile(r"\n{3,}")
+
+
+def normalize_model_text(text: str) -> str:
+    """モデル出力の文字列フィールドを後処理で正規化する。
+
+    - `<br>` / `<br/>` / `<br />` → `\\n` (画像内改行を保持)
+    - 他の HTML/XML タグ (`<p>`, `<hr>`, `<span>` 等) → strip (中身は残す)
+    - 連続する 3 個以上の改行は `\\n\\n` に圧縮 (タグ削除の副作用で生じる空行を整理)
+    """
+    if not text:
+        return text
+    text = _BR_TAG_RE.sub("\n", text)
+    text = _GENERIC_TAG_RE.sub("", text)
+    text = _EXCESS_NEWLINE_RE.sub("\n\n", text)
+    return text
 
 
 def truncate_for_log(text: str, limit: int = 500) -> str:
@@ -765,14 +789,21 @@ class OCRWorker:
 
         raw_tags = parsed.get("tags", [])
         if isinstance(raw_tags, list):
-            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+            tags = [
+                normalize_model_text(str(t)).strip()
+                for t in raw_tags
+                if str(t).strip()
+            ]
+            tags = [t for t in tags if t]
         else:
             tags = []
 
         return OCRResult(
-            text=str(parsed.get("text", "")).strip(),
-            background=str(parsed.get("background", "")).strip(),
-            profile_estimate=str(parsed.get("profile_estimate", "")).strip(),
+            text=normalize_model_text(str(parsed.get("text", ""))).strip(),
+            background=normalize_model_text(str(parsed.get("background", ""))).strip(),
+            profile_estimate=normalize_model_text(
+                str(parsed.get("profile_estimate", ""))
+            ).strip(),
             is_pr=bool(parsed.get("is_pr", False)),
             is_ugc=bool(parsed.get("is_ugc", False)),
             tags=tags,
