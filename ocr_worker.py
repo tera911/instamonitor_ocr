@@ -57,22 +57,21 @@ Also provide profile_estimate in Japanese as a free-form estimate of the poster/
 If the image truly contains no readable text, set no_text_detected=true.
 Set no_text_detected=false whenever there is any readable text, even if partial.
 
+Text fidelity rules:
+- Output plain Unicode characters only. Never insert HTML/XML tags such as <br>, <p>, <span>, or any other markup that is not actually drawn in the image.
+- For visual line breaks use a real newline inside the JSON string (the standard JSON escape).
+- Do not invent placeholder tokens. If you cannot read a character, omit it; do not write things like `<unk>` or `???`.
+
 Output format rules (MANDATORY):
-- Return ONLY the raw JSON object. Output MUST start with `{` and end with `}`.
+- Return ONLY the raw JSON object that matches the supplied schema. Output MUST start with `{` and end with `}`.
 - Do NOT wrap the JSON in markdown code fences. No triple backticks, no `json` language tag.
-- Do NOT add any prose, explanation, label, or commentary before or after the JSON.
-- NEVER write the backslash character `\\` anywhere in any JSON string value. Whenever you would write `\\` — whether it is a decorative slash in the image like `\\テキスト/`, a stray `\\` in the middle of a sentence, or anywhere else — write the literal token `<bs>` instead. Example: `\\待ってました/` MUST be `<bs>待ってました/`; `あ\\り` MUST be `あ<bs>り`.
-- For everything else, use standard JSON escapes: `\\n` for line breaks, `\\"` for a literal double quote.
-
-JSON shape:
-{"text":"<extracted text>","background":"<brief visual background>","profile_estimate":"<tentative profile estimate>","is_pr":true,"is_ugc":true,"tags":["tag1","tag2"],"no_text_detected":false}"""
+- Do NOT add any prose, explanation, label, or commentary before or after the JSON."""
 
 
-# LM Studio Structured Outputs (0.3.0+) で出力 JSON を文法的に強制する。
-# constrained sampling により \ の未エスケープ等の不正 JSON が物理的に出なくなる。
-# maxLength / maxItems は GBNF grammar に量化子として落ちる。
-# 注意: llama.cpp の grammar parser は大きな量化子 (1024 超?) を "exceeds sane defaults"
-# として弾き、schema 全体が silently 無効化される。maxLength は控えめに保つ。
+# vLLM (xgrammar / outlines) 向け Structured Outputs。
+# llama.cpp の GBNF parser と違って量化子の上限制約はない。一方で量化子を完全に外すと
+# Gemma 4 e4b は `text` フィールドで `\n` を延々生成して max_tokens まで暴走する事例が
+# 観測されたので、現実的な上限を schema 側で強制する。
 OCR_RESPONSE_SCHEMA: dict[str, Any] = {
     "name": "ocr_result",
     "strict": True,
@@ -198,6 +197,40 @@ class DashboardLogHandler(logging.Handler):
         self.state.add_log(message, record.levelno)
 
 
+def _parse_optional_bool(raw: str | None) -> bool | None:
+    """環境変数を tri-state bool として解釈する (未設定: None, true/false: bool)。"""
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"", "default", "auto", "none"}:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Cannot parse as optional bool: {raw!r}")
+
+
+def _parse_optional_int(raw: str | None) -> int | None:
+    """環境変数を optional int として解釈する (空 / "none" は None)。"""
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"", "default", "auto", "none"}:
+        return None
+    return int(value)
+
+
+def _parse_optional_float(raw: str | None) -> float | None:
+    """環境変数を optional float として解釈する。"""
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"", "default", "auto", "none"}:
+        return None
+    return float(value)
+
+
 def load_dotenv_file(path: Path) -> None:
     if not path.exists():
         return
@@ -280,17 +313,6 @@ def truncate_for_log(text: str, limit: int = 500) -> str:
     return f"{normalized[:limit]}... (truncated, total={len(normalized)} chars)"
 
 
-def restore_placeholders(text: str) -> str:
-    """VLM に書かせた `<bs>` をバックスラッシュに戻す。
-
-    llama.cpp の json_schema grammar は `"` や 制御文字 は弾くが、文字列値内の
-    生 `\\` だけは漏れて不正 JSON を生む (Gemma 4 e4b で再現)。回避策としてプロンプト
-    側で `\\` を出力させず `<bs>` プレースホルダで書かせ、Python 側で戻す。
-    `<br>` や `<dq>` は schema が制御文字 / `"` を物理的に抑止するため不要。
-    """
-    return text.replace("<bs>", "\\")
-
-
 def response_body_for_log(response: requests.Response | None, limit: int = 1000) -> str:
     if response is None:
         return ""
@@ -349,8 +371,21 @@ class OCRResult:
 
 @dataclass(frozen=True)
 class Endpoint:
+    """1 つの vLLM / LM Studio エンドポイントの設定。
+
+    optional フィールドはエンドポイント別の上書き用。`None` の項目は呼び出し側で
+    Config (= .env / グローバルデフォルト) の値にフォールバックされる。
+    """
+
     url: str
     concurrency: int
+    model: str | None = None
+    max_tokens: int | None = None
+    frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
+    enable_thinking: bool | None = None
+    thinking_token_budget: int | None = None
+    max_soft_tokens: int | None = None
 
 
 @dataclass
@@ -368,6 +403,11 @@ class Config:
     request_timeout_sec: int
     lm_studio_timeout_sec: int
     lm_studio_max_tokens: int
+    lm_studio_enable_thinking: bool | None
+    lm_studio_thinking_token_budget: int | None
+    lm_studio_max_soft_tokens: int | None
+    lm_studio_repetition_penalty: float | None
+    lm_studio_frequency_penalty: float | None
     request_retry_count: int
     request_retry_backoff_sec: float
     image_max_dim: int
@@ -420,10 +460,23 @@ class Config:
             request_timeout_sec=int(os.getenv("REQUEST_TIMEOUT_SEC", "30")),
             lm_studio_timeout_sec=int(os.getenv("LM_STUDIO_TIMEOUT_SEC", "180")),
             lm_studio_max_tokens=max(64, int(os.getenv("LM_STUDIO_MAX_TOKENS", "4096"))),
+            lm_studio_enable_thinking=_parse_optional_bool(os.getenv("LM_STUDIO_ENABLE_THINKING")),
+            lm_studio_thinking_token_budget=_parse_optional_int(
+                os.getenv("LM_STUDIO_THINKING_TOKEN_BUDGET")
+            ),
+            lm_studio_max_soft_tokens=_parse_optional_int(
+                os.getenv("LM_STUDIO_MAX_SOFT_TOKENS")
+            ),
+            lm_studio_repetition_penalty=_parse_optional_float(
+                os.getenv("LM_STUDIO_REPETITION_PENALTY")
+            ),
+            lm_studio_frequency_penalty=_parse_optional_float(
+                os.getenv("LM_STUDIO_FREQUENCY_PENALTY")
+            ),
             request_retry_count=max(1, int(os.getenv("REQUEST_RETRY_COUNT", "3"))),
             request_retry_backoff_sec=float(os.getenv("REQUEST_RETRY_BACKOFF_SEC", "2.0")),
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1280"))),
-            page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "50")))),
+            page_size=max(1, min(500, int(os.getenv("FETCH_PAGE_SIZE", "100")))),
         )
 
 
@@ -459,7 +512,46 @@ def load_endpoints(path: Path) -> list[Endpoint]:
             raise ValueError(
                 f"{path}: endpoints[{index}].concurrency must be a positive integer."
             )
-        endpoints.append(Endpoint(url=url, concurrency=concurrency))
+
+        def _opt(key: str, caster, validator=None):
+            """endpoint テーブルから optional 値を取り出して型変換する。"""
+            if key not in row or row[key] is None:
+                return None
+            try:
+                value = caster(row[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path}: endpoints[{index}].{key} has invalid value {row[key]!r}"
+                ) from exc
+            if validator is not None and not validator(value):
+                raise ValueError(
+                    f"{path}: endpoints[{index}].{key} failed validation: {value!r}"
+                )
+            return value
+
+        model = _opt("model", lambda v: str(v).strip(), lambda v: bool(v))
+        max_tokens = _opt("max_tokens", int, lambda v: v >= 1)
+        frequency_penalty = _opt("frequency_penalty", float)
+        repetition_penalty = _opt("repetition_penalty", float, lambda v: v > 0)
+        enable_thinking = _opt("enable_thinking", bool)
+        thinking_token_budget = _opt(
+            "thinking_token_budget", int, lambda v: v >= 1
+        )
+        max_soft_tokens = _opt("max_soft_tokens", int, lambda v: v >= 1)
+
+        endpoints.append(
+            Endpoint(
+                url=url,
+                concurrency=concurrency,
+                model=model,
+                max_tokens=max_tokens,
+                frequency_penalty=frequency_penalty,
+                repetition_penalty=repetition_penalty,
+                enable_thinking=enable_thinking,
+                thinking_token_budget=thinking_token_budget,
+                max_soft_tokens=max_soft_tokens,
+            )
+        )
     return endpoints
 
 
@@ -673,25 +765,82 @@ class OCRWorker:
 
         raw_tags = parsed.get("tags", [])
         if isinstance(raw_tags, list):
-            tags = [restore_placeholders(str(t)).strip() for t in raw_tags if str(t).strip()]
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
         else:
             tags = []
 
         return OCRResult(
-            text=restore_placeholders(str(parsed.get("text", ""))).strip(),
-            background=restore_placeholders(str(parsed.get("background", ""))).strip(),
-            profile_estimate=restore_placeholders(str(parsed.get("profile_estimate", ""))).strip(),
+            text=str(parsed.get("text", "")).strip(),
+            background=str(parsed.get("background", "")).strip(),
+            profile_estimate=str(parsed.get("profile_estimate", "")).strip(),
             is_pr=bool(parsed.get("is_pr", False)),
             is_ugc=bool(parsed.get("is_ugc", False)),
             tags=tags,
             no_text_detected=bool(parsed.get("no_text_detected", False)),
         )
 
-    def _call_lm_studio(self, image_url: str, prompt: str, endpoint_url: str) -> tuple[str, float]:
+    def _call_lm_studio(
+        self,
+        image_url: str,
+        prompt: str,
+        endpoint: Endpoint,
+        enable_thinking: bool | None = None,
+        thinking_token_budget: int | None = None,
+        max_soft_tokens: int | None = None,
+        repetition_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, float]:
+        """LM Studio / vLLM を 1 回叩く。
+
+        パラメータの解決順は **関数引数 > endpoint オブジェクト > Config (.env)**。
+        endpoints.toml で endpoint 別に値を指定しておくと、4B と 12B を別エンドポイント
+        として並べて、それぞれ最適なパラメータで叩ける。
+        """
         started_at = time.perf_counter()
         image_b64 = self._download_image_as_base64(image_url)
-        payload = {
-            "model": self.config.lm_studio_model,
+
+        # 解決順: 引数 > endpoint > config
+        resolved_model = model or endpoint.model or self.config.lm_studio_model
+        resolved_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else (endpoint.max_tokens or self.config.lm_studio_max_tokens)
+        )
+        if enable_thinking is None:
+            enable_thinking = (
+                endpoint.enable_thinking
+                if endpoint.enable_thinking is not None
+                else self.config.lm_studio_enable_thinking
+            )
+        if thinking_token_budget is None:
+            thinking_token_budget = (
+                endpoint.thinking_token_budget
+                if endpoint.thinking_token_budget is not None
+                else self.config.lm_studio_thinking_token_budget
+            )
+        if max_soft_tokens is None:
+            max_soft_tokens = (
+                endpoint.max_soft_tokens
+                if endpoint.max_soft_tokens is not None
+                else self.config.lm_studio_max_soft_tokens
+            )
+        if repetition_penalty is None:
+            repetition_penalty = (
+                endpoint.repetition_penalty
+                if endpoint.repetition_penalty is not None
+                else self.config.lm_studio_repetition_penalty
+            )
+        if frequency_penalty is None:
+            frequency_penalty = (
+                endpoint.frequency_penalty
+                if endpoint.frequency_penalty is not None
+                else self.config.lm_studio_frequency_penalty
+            )
+
+        payload: dict[str, Any] = {
+            "model": resolved_model,
             "messages": [
                 {
                     "role": "user",
@@ -707,15 +856,37 @@ class OCRWorker:
                 }
             ],
             "temperature": 0.0,
-            "max_tokens": self.config.lm_studio_max_tokens,
+            "max_tokens": resolved_max_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": OCR_RESPONSE_SCHEMA,
             },
         }
 
+        if enable_thinking is not None:
+            # vLLM の Gemma 4 テンプレは chat_template_kwargs.enable_thinking で
+            # reasoning の有無を切り替えられる。
+            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        if thinking_token_budget is not None:
+            # vLLM の Gemma4 reasoning parser が有効ならリクエストレベルで thinking の
+            # 上限トークンを切れる。reasoning 暴走で本文 (content) 用 token を食い切る
+            # 事故への hard guard。
+            payload["thinking_token_budget"] = thinking_token_budget
+        if max_soft_tokens is not None:
+            # Gemma 4 の vision token 数 (画像解像度) をリクエストレベルで上書き。
+            # サポート値: 70 / 140 / 280 (デフォルト) / 560 / 1120。
+            # 注意: vLLM 0.23 ではサーバー起動時 --mm-processor-kwargs での指定のみ確実に
+            # 効く。リクエストレベルでは silently 無視されるケースが観測されている。
+            payload["mm_processor_kwargs"] = {"max_soft_tokens": max_soft_tokens}
+        if repetition_penalty is not None:
+            # vLLM 拡張。1.0=無効、1.05〜1.2 で反復抑止。値が大きすぎると本文も歪む。
+            payload["repetition_penalty"] = repetition_penalty
+        if frequency_penalty is not None:
+            # OpenAI 互換。0.0=無効、0.1〜0.6 で軽い抑止。
+            payload["frequency_penalty"] = frequency_penalty
+
         response = requests.post(
-            endpoint_url,
+            endpoint.url,
             headers={
                 "Authorization": f"Bearer {self.config.lm_studio_api_key}",
                 "Content-Type": "application/json",
@@ -728,26 +899,37 @@ class OCRWorker:
         except requests.HTTPError as exc:
             logger.error(
                 "LM Studio request failed endpoint=%s status=%s body=%s",
-                endpoint_url,
+                endpoint.url,
                 response.status_code,
                 response_body_for_log(response),
             )
             raise exc
         body = response.json()
-        raw_text = (
-            body.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        choice = (body.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        raw_text = message.get("content")
         elapsed_sec = time.perf_counter() - started_at
+        if not isinstance(raw_text, str) or not raw_text:
+            # vLLM が max_tokens 到達や内部エラー時に content: null を返すケースを
+            # 確実に握りつぶさず、生レスポンスを残して上位で握れるようにする。
+            finish_reason = choice.get("finish_reason")
+            logger.error(
+                "LM Studio returned empty content endpoint=%s finish_reason=%s body=%s",
+                endpoint.url,
+                finish_reason,
+                truncate_for_log(json.dumps(body, ensure_ascii=False), limit=2000),
+            )
+            raise ValueError(
+                f"LM Studio returned empty content (finish_reason={finish_reason})"
+            )
         return raw_text, elapsed_sec
 
-    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str, endpoint_url: str) -> OCRResult:
-        raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt, endpoint_url)
+    def _run_lm_studio_ocr_once(self, image_url: str, prompt: str, endpoint: Endpoint) -> OCRResult:
+        raw_text, elapsed_sec = self._call_lm_studio(image_url, prompt, endpoint)
         result = self._parse_lm_studio_response(raw_text)
         logger.info(
             "OCR complete endpoint=%s elapsed=%.2fs result=%s",
-            endpoint_url,
+            endpoint.url,
             elapsed_sec,
             json.dumps(
                 {
@@ -779,7 +961,7 @@ class OCRWorker:
         )
         logger.info("Prompt in use:\n%s", self.config.lm_studio_prompt)
 
-        endpoint_url = self.config.endpoints[0].url
+        endpoint = self.config.endpoints[0]
         for index, item in enumerate(items, start=1):
             pk = str(item["pk"])
             taken_at = int(item["taken_at"])
@@ -793,13 +975,13 @@ class OCRWorker:
                 pk,
                 taken_at,
                 format_taken_at(taken_at),
-                endpoint_url,
+                endpoint.url,
                 image_url,
             )
 
             try:
                 raw_text, elapsed_sec = self._call_lm_studio(
-                    image_url, self.config.lm_studio_prompt, endpoint_url
+                    image_url, self.config.lm_studio_prompt, endpoint
                 )
             except (requests.RequestException, ValueError):
                 logger.exception("LM Studio call failed pk=%s", pk)
@@ -828,8 +1010,8 @@ class OCRWorker:
         logger.info("Test mode complete.")
         return 0
 
-    def run_lm_studio_ocr(self, image_url: str, endpoint_url: str) -> OCRResult:
-        result = self._run_lm_studio_ocr_once(image_url, self.config.lm_studio_prompt, endpoint_url)
+    def run_lm_studio_ocr(self, image_url: str, endpoint: Endpoint) -> OCRResult:
+        result = self._run_lm_studio_ocr_once(image_url, self.config.lm_studio_prompt, endpoint)
         if not result.text.strip() and not result.no_text_detected:
             # 文字を含まない投稿 (写真のみ等) は普通にあり得る。text 空 + no_text_detected=false
             # で返ってきた場合は「読めなかった = テキストなし」として保存する。background /
@@ -850,7 +1032,7 @@ class OCRWorker:
             )
         return result
 
-    def _process_media_item(self, item: dict[str, Any], endpoint_url: str) -> bool:
+    def _process_media_item(self, item: dict[str, Any], endpoint: Endpoint) -> bool:
         pk = str(item["pk"])
 
         with self._failed_pks_lock:
@@ -867,12 +1049,12 @@ class OCRWorker:
             pk,
             taken_at,
             format_taken_at(taken_at),
-            endpoint_url,
+            endpoint.url,
             full_image_url,
         )
 
         try:
-            result = self.run_lm_studio_ocr(full_image_url, endpoint_url)
+            result = self.run_lm_studio_ocr(full_image_url, endpoint)
         except (requests.RequestException, ValueError):
             with self._failed_pks_lock:
                 self._failed_pks.add(pk)
@@ -882,7 +1064,7 @@ class OCRWorker:
             logger.exception(
                 "OCR failed pk=%s endpoint=%s image=%s",
                 pk,
-                endpoint_url,
+                endpoint.url,
                 full_image_url,
             )
             return False
@@ -916,53 +1098,124 @@ class OCRWorker:
         )
         return True
 
-    def _process_media_batch(self, items: list[dict[str, Any]]) -> int:
-        if not items:
-            return 0
+    def process_cycle(self) -> dict[str, int]:
+        """連続パイプラインで /media/latest を空になるまで処理しきる。
 
-        item_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        for item in items:
-            item_queue.put(item)
-
-        counter_lock = threading.Lock()
-        processed_total = 0
-
+        従来のバッチ barrier (page を処理しきってから次の page を fetch) を撤廃。
+        prefetcher thread が queue 残量を監視し、低水位を切ったタイミングで次の page を
+        先読みする。worker はバッチ境界を意識せず queue から item を pull し続ける。
+        重複 fetch は in_flight_pks セットで弾く (API 側が処理中の pk を再度返してくる
+        ことを想定)。
+        """
         endpoints = self.config.endpoints
         total_workers = self.config.total_concurrency
+        # queue 残量がこの値を下回ったら prefetcher が次の page を取りに行く。
+        # 1 ページ分の fetch 中も worker を遊ばせないため worker 数より高めに張る。
+        low_watermark = max(1, total_workers * 2)
+
+        item_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        in_flight_pks: set[str] = set()
+        in_flight_lock = threading.Lock()
+        fetch_done = threading.Event()
+        workers_done = threading.Event()
+        counter_lock = threading.Lock()
+        counters = {"pages": 0, "processed": 0}
+
+        def fetch_into_queue() -> tuple[bool, int]:
+            """次のバッチを取得して queue に詰める。
+
+            Returns:
+                (exhausted, added): exhausted は API が空配列を返したとき True。
+                added は今回新しく queue に積まれた数 (重複は除外済み)。
+            """
+            try:
+                items = self.fetch_latest_media()
+            except Exception:
+                logger.exception("Prefetch fetch_latest_media failed")
+                return False, 0
+            if not items:
+                return True, 0
+            added = 0
+            with in_flight_lock:
+                for item in items:
+                    pk = str(item["pk"])
+                    if pk in in_flight_pks:
+                        continue
+                    in_flight_pks.add(pk)
+                    item_queue.put(item)
+                    added += 1
+            with counter_lock:
+                counters["pages"] += 1
+            logger.info(
+                "Fetched page items=%s added=%s queue_size=%s",
+                len(items),
+                added,
+                item_queue.qsize(),
+            )
+            return False, added
+
+        def prefetcher() -> None:
+            # API が「処理中の pk を再度返す」性質を持つので、added=0 でも exhausted とは
+            # 限らない。worker が in_flight を消化するまで少し待ってからリトライする。
+            while not workers_done.is_set():
+                if item_queue.qsize() >= low_watermark:
+                    time.sleep(0.2)
+                    continue
+                exhausted, added = fetch_into_queue()
+                if exhausted:
+                    fetch_done.set()
+                    return
+                if added == 0:
+                    # 重複のみ → in_flight が捌けるのを少し待つ
+                    time.sleep(1.0)
+
+        # 1ページ目は同期 fetch。API が空配列を返したらサイクル終了。
+        exhausted, _added = fetch_into_queue()
+        if exhausted:
+            return {"pages": counters["pages"], "processed": 0, "skipped": 0}
+
         logger.info(
-            "Processing batch items=%s endpoints=%s workers=%s breakdown=%s",
-            len(items),
+            "Starting pipeline endpoints=%s workers=%s breakdown=%s",
             len(endpoints),
             total_workers,
             ", ".join(f"{ep.url}={ep.concurrency}" for ep in endpoints),
         )
 
-        def run_worker(endpoint_url: str) -> None:
-            nonlocal processed_total
+        prefetch_thread = threading.Thread(
+            target=prefetcher, name="ocr-prefetcher", daemon=True
+        )
+        prefetch_thread.start()
+
+        def run_worker(endpoint: Endpoint) -> None:
             while True:
                 try:
-                    item = item_queue.get_nowait()
+                    item = item_queue.get(timeout=0.5)
                 except queue.Empty:
-                    return
+                    if fetch_done.is_set() and item_queue.empty():
+                        return
+                    continue
+                pk = str(item["pk"])
                 try:
-                    succeeded = self._process_media_item(item, endpoint_url)
+                    succeeded = self._process_media_item(item, endpoint)
                 except Exception:
                     if self.dashboard_state is not None:
                         self.dashboard_state.increment_failed()
-                    logger.exception("Unexpected error while processing OCR batch item")
+                    logger.exception("Unexpected error while processing OCR item")
                     succeeded = False
                 finally:
+                    with in_flight_lock:
+                        in_flight_pks.discard(pk)
                     item_queue.task_done()
                 if succeeded:
                     with counter_lock:
-                        processed_total += 1
+                        counters["processed"] += 1
 
         threads: list[threading.Thread] = []
         for ep in endpoints:
             for slot in range(ep.concurrency):
                 thread = threading.Thread(
                     target=run_worker,
-                    args=(ep.url,),
+                    args=(ep,),
                     name=f"ocr-worker[{ep.url}#{slot}]",
                     daemon=True,
                 )
@@ -972,16 +1225,10 @@ class OCRWorker:
         for thread in threads:
             thread.join()
 
-        return processed_total
+        workers_done.set()
+        prefetch_thread.join(timeout=5)
 
-    def process_cycle(self) -> dict[str, int]:
-        items = self.fetch_latest_media()
-        processed_count = self._process_media_batch(items) if items else 0
-        return {
-            "pages": 1,
-            "processed": processed_count,
-            "skipped": 0,
-        }
+        return {"pages": counters["pages"], "processed": counters["processed"], "skipped": 0}
 
     def run_forever(self) -> None:
         breakdown = ", ".join(
