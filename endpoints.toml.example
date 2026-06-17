@@ -1,40 +1,12 @@
-# LM Studio / vLLM エンドポイント定義
+# LM Studio エンドポイント定義
 # OCR_ENDPOINTS_FILE 環境変数でパスを指定する (未設定時は endpoints.toml をカレントから探す)
-#
-# 必須項目:
-#   url          : chat/completions の URL
-#   concurrency  : このエンドポイントに同時投げ込む数 (GPU/VRAM に合わせて調整)
-#
-# 任意項目 (指定するとそのエンドポイントだけ .env のグローバル値を上書きする):
-#   model                  : OpenAI 互換 API の model フィールドへ送る ID
-#   max_tokens             : リクエストごとの max_tokens (モデルの max_model_len 制約に注意)
-#   frequency_penalty      : OpenAI 互換。0.1 (12B 推奨) / 0.3 (E4B 推奨) 等
-#   repetition_penalty     : vLLM 拡張。1.05〜1.2。frequency_penalty と排他で使うと無難
-#   enable_thinking        : Gemma 4 系の reasoning モードを ON/OFF
-#   thinking_token_budget  : reasoning の上限トークン (vLLM が強制終了させる)
-#   max_soft_tokens        : Gemma 4 vision token 数 (リクエスト時上書き、ただし vLLM は
-#                            サーバー起動時 --mm-processor-kwargs での指定でないと
-#                            silently 無視するケースあり)
+# url: LM Studio (OpenAI 互換) の chat/completions エンドポイント
+# concurrency: そのエンドポイントに同時投げ込む数 (GPU/VRAM に合わせて調整)
 
-# 例 1: Gemma 4 12B (推奨)
 [[endpoints]]
-url = "http://machine-12b:1234/v1/chat/completions"
-concurrency = 64
-model = "google/gemma-4-e4b"   # vLLM 側で 12B にバインドした alias でも可
-max_tokens = 4096               # max_model_len=8192 と prompt 余裕を考慮
-frequency_penalty = 0.1         # 12B は反復しにくいので緩め
-enable_thinking = false
+url = "http://machine-a:1234/v1/chat/completions"
+concurrency = 4
 
-# 例 2: Gemma 4 E4B (旧構成 / フォールバック用)
 [[endpoints]]
-url = "http://machine-e4b:1234/v1/chat/completions"
-concurrency = 64
-model = "google/gemma-4-e4b"
-max_tokens = 8192
-frequency_penalty = 0.3         # E4B は反復暴走しやすいので強め
-enable_thinking = false
-
-# 例 3: 最小構成 (上記の上書きを全て .env のグローバル値に任せる)
-# [[endpoints]]
-# url = "http://machine-default:1234/v1/chat/completions"
-# concurrency = 4
+url = "http://machine-b:1234/v1/chat/completions"
+concurrency = 2

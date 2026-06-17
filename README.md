@@ -55,25 +55,17 @@ export OCR_ENDPOINTS_FILE="$PWD/endpoints.toml"
 export LM_STUDIO_MODEL="your-vision-model"
 ```
 
-`endpoints.toml` は URL ごとに並列度と (任意で) モデル固有の推論パラメータを指定します。`endpoints.toml.example` をコピーして編集してください。
+`endpoints.toml` は次のように URL ごとに並列度を指定します。`endpoints.toml.example` をコピーして編集してください。
 
 ```toml
-# 必須
 [[endpoints]]
 url = "http://machine-a:1234/v1/chat/completions"
 concurrency = 4
 
-# 任意項目を書くと、そのエンドポイントだけ .env のグローバル値を上書きする
 [[endpoints]]
 url = "http://machine-b:1234/v1/chat/completions"
-concurrency = 64
-model = "google/gemma-4-e4b"
-max_tokens = 4096
-frequency_penalty = 0.1
-enable_thinking = false
+concurrency = 2
 ```
-
-エンドポイント別に指定できるパラメータは `model` / `max_tokens` / `frequency_penalty` / `repetition_penalty` / `enable_thinking` / `thinking_token_budget` / `max_soft_tokens`。書かなかった項目は `.env` (`LM_STUDIO_*`) のグローバル値、それも無ければコード内デフォルトへ順にフォールバックします。**4B エンドポイントと 12B エンドポイントを並べて、それぞれ最適な `frequency_penalty` で叩く**といった運用が可能です。
 
 旧設定 (`LM_STUDIO_API_URL` / `LM_STUDIO_API_URLS` / `OCR_CONCURRENCY` / `OCR_SHARD_*`) は廃止しています。並列度は `endpoints.toml` の `concurrency` で URL ごとに調整してください。
 
@@ -104,7 +96,7 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 実際にモデルへ投げているプロンプトは `ocr_worker.py` 内に定数として置いてあります。プロンプトを変えたいときは下記を直接編集するか、`LM_STUDIO_OCR_PROMPT` 環境変数で `DEFAULT_PROMPT` を上書きしてください。
 
-- [`DEFAULT_PROMPT`](./ocr_worker.py#L32-L71) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
+- [`DEFAULT_PROMPT`](./ocr_worker.py#L30-L60) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
 
 旧 `FALLBACK_PROMPT` および OCR 自体の retry は廃止しています。LM Studio の返答が空 / 不正 JSON だった場合は即時失敗扱いとし、原因をログから追って prompt 側を直す方針です。
 
@@ -126,34 +118,14 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 出力 JSON は LM Studio の Structured Outputs (`response_format: json_schema`) で文法的に強制しているため、バックスラッシュ未エスケープ等の不正 JSON が物理的に発生しません。万一に備えてパーサーは最初の `{` から最後の `}` までを切り出すフォールバックも持っています。
 
-### 推論暴走対策 (max_tokens / maxLength / penalty / thinking)
+### 推論暴走対策 (max_tokens / maxLength)
 
-文字びっしりの画像や、モデルが緩いループに陥ったときに推論が止まらず `LM_STUDIO_TIMEOUT_SEC` を踏み抜くことがあります。これを抑えるため、複数のガードを重ねています。
+文字びっしりの画像や、モデルが緩いループに陥ったときに推論が止まらず `LM_STUDIO_TIMEOUT_SEC` を踏み抜くことがあります。これを抑えるため、payload に `max_tokens` を、schema の各フィールドに `maxLength` / `maxItems` を入れています。
 
-- `LM_STUDIO_MAX_TOKENS` (最小 64) — 推論時間そのものを切るためのハード上限。デフォルトは 4096、E4B / 12B では後述の表参照
-- schema 側の `maxLength` (text=4000, background=1000, profile_estimate=1000, tags items=64, tags maxItems=20) — 構造化出力 grammar に量化子として落ちて、内容が長くなりすぎることを構文レベルで防ぎます。vLLM では量化子上限制約はなく、llama.cpp 系の制約も text=4000 までなら問題ありません
-- `LM_STUDIO_FREQUENCY_PENALTY` (OpenAI 互換) — 反復ループ (`\n\n\n…` や `しししし…` のような暴走) を抑止する第一の打ち手。0.1〜0.3 の範囲で効きます (0.5 以上は本文を歪めるので非推奨)
-- `LM_STUDIO_REPETITION_PENALTY` (vLLM 拡張) — `frequency_penalty` の代替候補ですが Gemma 4 系では 1.05 でも強すぎて text フィールドが空になる副作用を観測。`frequency_penalty` を推奨します
-- `LM_STUDIO_ENABLE_THINKING` (Gemma 4 系) — reasoning モードの有無。`true` だと reasoning が `max_tokens` を食い切って `content=null` になる事故が起きやすいので、現状は `false` 推奨。reasoning を活かしたい場合は `LM_STUDIO_THINKING_TOKEN_BUDGET` で reasoning の上限トークンを切ること
-- `LM_STUDIO_MAX_SOFT_TOKENS` (Gemma 4 系) — vision token 数 (画像解像度)。サポート値 70 / 140 / 280 (デフォルト) / 560 / 1120。OCR 精度を上げたい場合に有効ですが、**vLLM 0.23 ではリクエストレベルで silently 無視されるケースを観測**。確実に効かせるには `vllm serve ... --mm-processor-kwargs '{"max_soft_tokens": 560}'` でサーバー側に渡す
+- `LM_STUDIO_MAX_TOKENS` (デフォルト 4096, 最小 64) — 推論時間そのものを切るためのハード上限。ループ系のタイムアウトに直接効きます
+- schema 側の `maxLength` (text=8000, background=1000, profile_estimate=1000, tags items=64, tags maxItems=20) — LM Studio (llama.cpp) の GBNF grammar に量化子として落ちて、内容が長くなりすぎることを構文レベルで防ぎます
 
-#### モデル別の推奨パラメータ
-
-セッション内の 100 件規模 A/B 評価で得られた、`google/gemma-4-*-it-qat-w4a16-ct` (vLLM 0.23 + xgrammar) 向けの最適値です。`endpoints.toml` の任意項目として書くか、`.env` のグローバル値として書きます。
-
-| パラメータ | E4B (4B 系) | 12B | 備考 |
-| --- | --- | --- | --- |
-| `model` | `google/gemma-4-e4b` | `google/gemma-4-e4b` (alias) | 12B は vLLM 側で E4B 互換 alias を切ってる前提 |
-| `max_tokens` | 8192 | 4096 | 12B は `max_model_len=8192` 制約あり |
-| `frequency_penalty` | **0.3** | **0.1** | E4B は反復暴走しやすいので強め、12B は緩めで十分 |
-| `enable_thinking` | false | false | thinking on は reasoning 暴走で content=null が出る・text が短縮される副作用、Speed も 3 倍遅 |
-| `concurrency` | 64 | 64 | vLLM の `--max-num-seqs` を超えなければ 96 / 128 まで余地あり (proxy 無しの本番想定) |
-| 期待 throughput | 〜7 req/s | 〜1.7 req/s | 100件×並列8の実測値ベース。本番並列ではスケール |
-| corruption (HTMLタグ等) | ほぼゼロ | raw では `<br>` が約 25% に混入 → **`normalize_model_text` で `\n` に正規化済み** | 12B は改行を `<br>` で表現する癖を持つが、parse 後の `OCRResult.text` 等には残らない |
-
-12B の `<br>` 癖は学習バイアスで、画像内の改行を表現する **正当な記号** です (情報損失なし)。ワーカー側で `normalize_model_text` が `<br>` を `\n` に変換し、それ以外の HTML/XML タグ (`<p>`, `<hr>` の反復暴走パターンを含む) は中身だけ残して strip します。連続改行は `\n\n` まで圧縮されます。
-
-両ガードを重ねるのは、`max_tokens` だけだと壊れた途中で切れた JSON が返る可能性があるため。`maxLength` で構造的に閉じる、`frequency_penalty` で反復自体を止める、`max_tokens` で最終クリーンカット、という三段構えになっています。
+両方積むのは、`max_tokens` だけだと壊れた途中で切れた JSON が返る可能性があるためで、`maxLength` と組み合わせると上限内なら閉じた JSON、超えても max_tokens でクリーンに切断、という棲み分けになります。
 
 ### API に POST する JSON
 
