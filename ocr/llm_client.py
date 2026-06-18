@@ -39,6 +39,7 @@ def call_lm_studio(
     endpoint_url: str,
     config: Config,
     disable_thinking: bool = False,
+    max_soft_tokens: int | None = None,
 ) -> tuple[str, float]:
     """1 タスク分の LLM 呼び出し。画像はあらかじめ base64 化したものを受け取る。
 
@@ -46,8 +47,11 @@ def call_lm_studio(
     画像取得は呼び出し側 (run_pipeline) に持ち、ここでは送信のみ行う。
 
     disable_thinking=True で payload に chat_template_kwargs.enable_thinking=False を
-    入れる。vLLM の Gemma 系 reasoning モードを切る用途。未知フィールドはサーバー側で
-    silently 無視されるので、LM Studio / 旧 vLLM でもそのまま動く。
+    入れる。vLLM の Gemma 系 reasoning モードを切る用途。
+    max_soft_tokens=N で mm_processor_kwargs.max_soft_tokens=N を入れる。Gemma 4 系の
+    vision token 数 (画像解像度) をタスク別に切り替える用途。
+    未知フィールドはサーバー側で silently 無視されるので、LM Studio / 旧 vLLM でも
+    そのまま動く (= 効かないだけで壊れない)。
     """
     started_at = time.perf_counter()
     payload: dict[str, Any] = {
@@ -75,6 +79,8 @@ def call_lm_studio(
     }
     if disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if max_soft_tokens is not None:
+        payload["mm_processor_kwargs"] = {"max_soft_tokens": max_soft_tokens}
 
     response = requests.post(
         endpoint_url,
@@ -315,6 +321,7 @@ def run_pipeline(image_url: str, endpoint: Endpoint, config: Config) -> OCRResul
                 endpoint.url,
                 config,
                 disable_thinking=task.disable_thinking,
+                max_soft_tokens=task.max_soft_tokens,
             )
         except requests.RequestException as exc:
             # どのタスク段で失敗したかを上層 (report 等) で識別できるよう task 名を含める。

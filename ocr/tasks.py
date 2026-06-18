@@ -129,6 +129,15 @@ class OcrTask:
         `<empty>` / 空白だけ を「テキスト無し」と解釈し、text を "" にリセットして
         no_text_detected=True を accumulator に詰める。OCR タスクの schema を text 1 つ
         に絞り、判断責務を Python 側に持つための仕組み。
+    max_soft_tokens: Gemma 4 系の vision token 数をリクエストレベルで上書きする。
+        None なら指定なし (= サーバ起動時設定 or モデルデフォルト)。
+        サポート値: 70 / 140 / 280 / 560 / 1120。OCR は 1120 (高解像度) で、
+        背景・分類タスクは 140 (低解像度) を割り当てるなど用途別の精度/速度
+        トレードオフを宣言する。注意: vLLM 0.23 ではリクエストレベルの
+        mm_processor_kwargs が silently 無視される事例が観測されているため、
+        確実に効かせたい解像度はサーバー起動引数
+        `--mm-processor-kwargs '{"max_soft_tokens": <n>}'` で張った上で、
+        下げたいタスクだけ payload 上書きするのが安全。
     fields: このタスクが結果として埋めるキー (ロギング / バリデーション用)。
     """
 
@@ -140,6 +149,7 @@ class OcrTask:
     needs_ocr_text: bool = False
     disable_thinking: bool = False
     derive_no_text_detected: bool = False
+    max_soft_tokens: int | None = None
 
 
 OCR_TEXT_SCHEMA: dict[str, Any] = {
@@ -282,6 +292,8 @@ TASK_OCR = OcrTask(
     # text 1 フィールドだけ書かせ、no_text_detected は run_pipeline 側で text の
     # 空 / `<empty>` 判定から導出する。
     derive_no_text_detected=True,
+    # 文字を粒子レベルで読み取る必要があるので vision token 上限の 1120 を割り当てる。
+    max_soft_tokens=1120,
 )
 
 TASK_CONTEXT = OcrTask(
@@ -292,6 +304,8 @@ TASK_CONTEXT = OcrTask(
     # 画像から直接読める情報 (背景・プロフィール推定) なので、OCR テキスト無しでも実行する。
     # text 空時は prompt の {ocr_text} が `(no text)` で埋まり、画像のみを根拠に判定させる。
     needs_ocr_text=True,
+    # 背景・プロフィール推定は構図と全体の雰囲気が分かれば足りるので、低解像度で速度優先。
+    max_soft_tokens=140,
 )
 
 TASK_CLASSIFICATION = OcrTask(
@@ -302,6 +316,8 @@ TASK_CLASSIFICATION = OcrTask(
     # is_ugc / tags は画像視覚で判定可能、is_pr は text 必須だが OCR `(no text)` 時は
     # 画像内に "PR" 文字が無いので自動的に false に倒れる想定。CONTEXT と同様に実行する。
     needs_ocr_text=True,
+    # 分類タスクも荒い視覚で十分なので低解像度に倒して速度を稼ぐ。
+    max_soft_tokens=140,
 )
 
 TASK_ALL_IN_ONE = OcrTask(
