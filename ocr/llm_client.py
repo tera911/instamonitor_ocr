@@ -70,7 +70,6 @@ def call_lm_studio(
                 ],
             }
         ],
-        "temperature": 0.0,
         "max_tokens": config.lm_studio_max_tokens,
         "response_format": {
             "type": "json_schema",
