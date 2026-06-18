@@ -4,3 +4,4 @@ __pycache__/
 .pycache/
 endpoints.toml
 *.log
+/reports/

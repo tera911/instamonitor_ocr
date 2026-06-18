@@ -6,7 +6,8 @@
 
 - **配信優先度**: サーバーは「当日 (JST 00:00 以降) の未処理を `taken_at` 昇順」→「過去の未処理を `taken_at` 降順」の順で返します。
 - **再 OCR**: `OCR_VERSION` を毎リクエストにクエリ `current_version` として渡すので、`OCR_VERSION` を上げるだけで古いバージョンの投稿が再配信されます。`OCR_INCLUDE_DONE` のような明示フラグは不要になりました。
-- **複数 LM Studio エンドポイント (並列度を個別調整)**: `endpoints.toml` で URL ごとに `concurrency` を指定します (`endpoints.toml.example` を参照)。Python プロセス 1 台が共有キューを持ち、各エンドポイント × `concurrency` 個のワーカースレッドが空き次第キューから取って自分の URL に投げる動的振り分け方式です。強いマシンに大きな `concurrency`、弱いマシンに小さい `concurrency` を割り当てれば、速い側が遅い側を待たずに先に消化していきます。
+- **複数 LM Studio エンドポイント (並列度を個別調整)**: `endpoints.toml` で URL ごとに `concurrency` と `mode` を指定します (`endpoints.toml.example` を参照)。Python プロセス 1 台が共有キューを持ち、各エンドポイント × `concurrency` 個のワーカースレッドが空き次第キューから取って自分の URL に投げる動的振り分け方式です。強いマシンに大きな `concurrency`、弱いマシンに小さい `concurrency` を割り当てれば、速い側が遅い側を待たずに先に消化していきます。
+- **タスク分割 (Q4 等での精度低下対策)**: `mode = "split"` を指定したエンドポイントは、1 画像を「OCR」「文脈推定 (background / profile_estimate)」「分類 (is_pr / is_ugc / tags)」の 3 リクエストに分割して投げます。Q4 量子化モデルで OCR と分類タスクを 1 プロンプトに混ぜると attention が崩れて両方とも劣化する事象に対する回避策です。後段の 2 タスクには 1 つ前で得た OCR テキストを `{ocr_text}` 経由で渡します。OCR で `no_text_detected=true` が立った場合は残り 2 タスクをスキップします。Q8 等で精度に余裕があるエンドポイントは `mode = "oneshot"` (デフォルト) のままで OK です。
 - **複数台運用は非推奨**: 旧 `OCR_SHARD_COUNT` / `OCR_SHARD_INDEX` は廃止しました。サーバー側に重複排除の仕組みは無いので、本ワーカーは **必ず 1 プロセスのみ** 起動してください。スループットは LM Studio エンドポイントの台数と各 `concurrency` で稼ぎます。
 
 1 サイクルでサーバーから最大 `FETCH_PAGE_SIZE` 件を取得 → 全件処理 → 0 件なら `IDLE_SLEEP_SEC` (デフォルト 60 秒) 待機します。
@@ -55,16 +56,18 @@ export OCR_ENDPOINTS_FILE="$PWD/endpoints.toml"
 export LM_STUDIO_MODEL="your-vision-model"
 ```
 
-`endpoints.toml` は次のように URL ごとに並列度を指定します。`endpoints.toml.example` をコピーして編集してください。
+`endpoints.toml` は次のように URL ごとに並列度と `mode` を指定します。`endpoints.toml.example` をコピーして編集してください。
 
 ```toml
 [[endpoints]]
 url = "http://machine-a:1234/v1/chat/completions"
 concurrency = 4
+mode = "oneshot"  # 省略時のデフォルト。1 リクエストで全項目を生成する
 
 [[endpoints]]
 url = "http://machine-b:1234/v1/chat/completions"
 concurrency = 2
+mode = "split"    # OCR / 文脈 / 分類 を 3 リクエストに分割する (Q4 等の精度低下対策)
 ```
 
 旧設定 (`LM_STUDIO_API_URL` / `LM_STUDIO_API_URLS` / `OCR_CONCURRENCY` / `OCR_SHARD_*`) は廃止しています。並列度は `endpoints.toml` の `concurrency` で URL ごとに調整してください。
@@ -83,20 +86,53 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 .venv/bin/python ocr_worker.py --no-dashboard
 ```
 
-プロンプト調整用のテストモード（API には書き戻さない。生応答とパース結果をフル出力する）:
+プロンプト調整用のテストモード（API には書き戻さない。デフォルトはログのみ）:
 
 ```bash
-.venv/bin/python ocr_worker.py --test            # 既定で3件
-.venv/bin/python ocr_worker.py --test --limit 1  # 件数指定
+.venv/bin/python ocr_worker.py --test                                # 既定で3件
+.venv/bin/python ocr_worker.py --test --limit 10                     # 件数指定
+.venv/bin/python ocr_worker.py --test --pk 12345                     # pk 単体を指定
+.venv/bin/python ocr_worker.py --test --pk 12345,67890               # 複数 pk をカンマ区切りで指定
+.venv/bin/python ocr_worker.py --test --limit 10 --skip-no-text-detect   # text 入りだけ 10 件集める
+.venv/bin/python ocr_worker.py --test --report                       # HTML レポートも出す
+.venv/bin/python ocr_worker.py --test --report --report-dir ~/ocr_reports  # 出力先を変える
 ```
 
-`--test` は `LM_STUDIO_OCR_PROMPT`（未設定なら `DEFAULT_PROMPT`）をそのまま 1 回試行します。テストモードでは `endpoints.toml` の先頭エンドポイントだけを使います。
+テストモードでは `endpoints.toml` の先頭エンドポイントだけを使い、そのエンドポイントの `concurrency` 分のスレッドで並列に投げます (HTTP・画像 download と LLM 呼び出しの I/O 待ちを埋めて GPU を遊ばせないため)。先頭の `mode` が `"split"` なら 3 タスクを順に走らせ、`"oneshot"` なら従来通り 1 リクエストで動きます。
 
-## プロンプト
+`--pk` を付けると `/media/latest` から返ってきたページのうち、指定 pk と一致するものだけを処理対象にします（`--limit` / `--skip-no-text-detect` は無視されます）。pk が現ページに居ない（=その `OCR_VERSION` ではサーバー側で既に処理済みと判定されている）場合は warning を出してスキップするので、強制的に再テストしたいときは `OCR_VERSION` を bump してから実行してください。
 
-実際にモデルへ投げているプロンプトは `ocr_worker.py` 内に定数として置いてあります。プロンプトを変えたいときは下記を直接編集するか、`LM_STUDIO_OCR_PROMPT` 環境変数で `DEFAULT_PROMPT` を上書きしてください。
+`--skip-no-text-detect` を付けると、OCR 結果が `no_text_detected=true` だった投稿は採用カウントから外し、text 入り (= 検証になる) 投稿が `--limit` 件集まるまで `/media/latest` の続きを引き出して投げ続けます。1 ページ (`FETCH_PAGE_SIZE` 件) スキャンしきっても件数が足りない場合は集まった分だけで終了し、warning が出ます。
 
-- [`DEFAULT_PROMPT`](./ocr_worker.py#L30-L60) — 唯一のプロンプト（通常運用 / `--test` モードどちらも同じものを使う）
+`--report` を付けたときだけ、`<report-dir>/test_<timestamp>/index.html` が生成されます (デフォルト出力先 `./reports/`、`.gitignore` 済み)。HTML は CDN URL を `<img src>` で埋め込むので、サムネ表示には API key 不要の公開 URL であることが前提です。生成後はブラウザで開けば画像と OCR テキスト / background / profile_estimate / tags / is_pr / is_ugc を 1 列で並べて目視比較できます。普段の高速確認はログだけで足りるので opt-in にしています。
+
+## プロンプトとタスクパイプライン
+
+モデルに投げているプロンプトと JSON schema は `ocr_worker.py` 内に定数として置いてあります。
+
+- **one-shot mode** (`mode = "oneshot"`)
+  - `DEFAULT_PROMPT` + `OCR_RESPONSE_SCHEMA` を 1 リクエストで投げる
+  - 全項目を 1 度で生成する従来動作
+- **split mode** (`mode = "split"`)
+  - `OCR_TEXT_PROMPT` + `OCR_TEXT_SCHEMA` (text / no_text_detected)
+  - `CONTEXT_PROMPT` + `CONTEXT_SCHEMA` (background / profile_estimate, 画像 + OCR テキストを入力)
+  - `CLASSIFICATION_PROMPT` + `CLASSIFICATION_SCHEMA` (is_pr / is_ugc / tags, 画像 + OCR テキストを入力)
+  - を順に投げ、結果をマージして 1 件の出力 JSON にする
+
+### 新しいタスクを追加したいとき
+
+`ocr_worker.py` の `OcrTask` を 1 つ書いて `TASK_PIPELINES["split"]` のタプル末尾に追加するだけで、split mode のパイプライン後段に組み込まれます。`OcrTask` のフィールド:
+
+| field | 説明 |
+| --- | --- |
+| `name` | ログ表示用の識別子 (例: `"ocr"`, `"context"`, `"safety_check"`) |
+| `prompt` | このタスクで送るプロンプト。`needs_ocr_text=True` なら `{ocr_text}` プレースホルダで OCR 結果が埋め込まれる |
+| `schema` | このタスクの Structured Outputs 用 JSON schema |
+| `fields` | このタスクが埋めるキー (ログ / バリデーション用) |
+| `skip_if_no_text` | 直前までに `no_text_detected=true` が立っていたらスキップする |
+| `needs_ocr_text` | prompt に OCR 結果テキストを差し込む |
+
+新しい mode (例: `"split_with_safety"`) を作りたい場合は `TASK_PIPELINES` に `(tuple[OcrTask, ...])` を 1 行追加します。`endpoints.toml` の `mode` 値に未知の文字列を書くと起動時に弾かれます。
 
 旧 `FALLBACK_PROMPT` および OCR 自体の retry は廃止しています。LM Studio の返答が空 / 不正 JSON だった場合は即時失敗扱いとし、原因をログから追って prompt 側を直す方針です。
 
@@ -161,6 +197,6 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 プロンプトや出力形式を更新して再OCRしたいときは `OCR_VERSION` を変更してください。サーバー側が `current_version` を見て古いバージョンの投稿を自動的に再配信します。
 
-画像は OCR 前にアスペクト比を維持したまま長辺 `IMAGE_MAX_DIM` まで縮小します。
+画像は OCR 前にアスペクト比を維持したまま長辺 `IMAGE_MAX_DIM` (デフォルト 1920) まで縮小します。Instagram の Stories / Reels がネイティブ 1080×1920 なので、これで素通りさせ OCR 精度を稼ぐ前提です。フィード正方形 / ポートレートは元々それ以下なので無処理、長辺 2000 超の高解像度広告だけ 1920 に丸めます。VRAM / 速度に余裕があれば 2048 や 2560 に上げても良いです。
 
 デフォルトのダッシュボードでは上段に色付きログ、下段に毎分の成功/失敗件数グラフ、ヘッダに現在処理中の投稿と累計件数を表示します。`q` で抜けられます。

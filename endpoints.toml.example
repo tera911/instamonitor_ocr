@@ -1,12 +1,22 @@
-# LM Studio エンドポイント定義
+# LM Studio / vLLM エンドポイント定義
 # OCR_ENDPOINTS_FILE 環境変数でパスを指定する (未設定時は endpoints.toml をカレントから探す)
-# url: LM Studio (OpenAI 互換) の chat/completions エンドポイント
+# url:         OpenAI 互換 chat/completions エンドポイント
 # concurrency: そのエンドポイントに同時投げ込む数 (GPU/VRAM に合わせて調整)
+# mode:        リクエストの組み立て方
+#                "oneshot" (default) : 1 リクエストで OCR + 文脈 + 分類を全部やらせる
+#                "split"             : OCR / 文脈 / 分類 を 3 リクエストに分割し、後段の
+#                                      プロンプトには 1 つ前で得た OCR テキストを渡す
+#              Q8 など精度に余裕がある量子化モデルは "oneshot" のままで OK。
+#              Q4 等で「OCR と分類を混ぜると両方とも劣化する」モデルは "split" を指定する。
 
 [[endpoints]]
+# Q8 系 (one-shot で十分な精度が出るエンドポイント)
 url = "http://machine-a:1234/v1/chat/completions"
 concurrency = 4
+mode = "oneshot"
 
 [[endpoints]]
+# Q4 系 (タスクを分けないと精度が落ちるエンドポイント)
 url = "http://machine-b:1234/v1/chat/completions"
 concurrency = 2
+mode = "split"
