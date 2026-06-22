@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -203,7 +203,80 @@ def _try_repair_and_parse(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return None, None
 
 
-def parse_lm_studio_response(response_text: str) -> dict[str, Any]:
+_LLM_REPAIR_SYSTEM_PROMPT = (
+    "You are a strict JSON syntax repair tool. The user gives you a JSON-like "
+    "string that fails to parse. Output ONLY a valid JSON object with the same "
+    "keys and values. DO NOT translate, summarize, rewrite, or alter any string "
+    "values. DO NOT add new keys. DO NOT remove keys. Only fix syntax: extra "
+    "characters, missing brackets, wrong delimiters, mismatched braces. "
+    "Output the repaired JSON object with no commentary, no code fence."
+)
+
+
+def _llm_repair_json(
+    raw: str,
+    endpoint: Endpoint,
+    config: Config,
+) -> dict[str, Any] | None:
+    """壊れた raw JSON を同じ endpoint に「syntax だけ直して」と投げて parse する。
+
+    既存の正規表現 repair が全滅したときの最終フォールバック。1 回だけ呼び出し、
+    タイムアウト・エラー・再 parse 不能なら None を返す (= 上層で従来通り ValueError)。
+    system prompt で「値を変えるな」と強く指示することで text の改変を防ぐ。
+    """
+    payload: dict[str, Any] = {
+        "model": config.lm_studio_model,
+        "messages": [
+            {"role": "system", "content": _LLM_REPAIR_SYSTEM_PROMPT},
+            {"role": "user", "content": raw},
+        ],
+        "temperature": 0,
+        "max_tokens": config.lm_studio_max_tokens,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+        # 修復は syntax 直しのみで thinking 不要。遅延を抑える。
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        response = requests.post(
+            endpoint.url,
+            headers={
+                "Authorization": f"Bearer {config.lm_studio_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=config.lm_studio_timeout_sec,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "LLM JSON repair request failed endpoint=%s error=%s",
+            endpoint.url,
+            exc,
+        )
+        return None
+
+    body = response.json()
+    repaired_text = (
+        body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    )
+    if not repaired_text:
+        return None
+    try:
+        parsed = json.loads(repaired_text, strict=False)
+    except json.JSONDecodeError as exc:
+        logger.warning("LLM repair output still unparseable: %s", exc)
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def parse_lm_studio_response(
+    response_text: str,
+    *,
+    llm_repair: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     """LM Studio / vLLM の content 文字列を dict に parse する。
 
     Structured Outputs で型保証されていても、Gemma 4 12B 系で
@@ -241,6 +314,20 @@ def parse_lm_studio_response(response_text: str) -> dict[str, Any]:
 
         if parsed is None:
             repaired, repair_name = _try_repair_and_parse(raw)
+            if repaired is None and llm_repair is not None:
+                # ローカル repair チェーンが全滅した場合のみ LLM に投げて syntax 修復を試す。
+                # endpoint への round-trip 1 回分のレイテンシが乗るので最終フォールバック扱い。
+                try:
+                    llm_repaired = llm_repair(raw)
+                except Exception:
+                    logger.exception("LLM repair raised unexpected exception")
+                    llm_repaired = None
+                if llm_repaired is not None:
+                    logger.warning(
+                        "LM Studio response was malformed but recovered via repair=llm"
+                    )
+                    repaired = llm_repaired
+                    repair_name = "llm"
             if repaired is None:
                 logger.error(
                     "LM Studio response JSON parse failed error=%s\n"
@@ -252,10 +339,11 @@ def parse_lm_studio_response(response_text: str) -> dict[str, Any]:
                     f"LM Studio JSON parse failed ({exc})\n"
                     f"--- raw response ---\n{raw}"
                 ) from exc
-            logger.warning(
-                "LM Studio response was malformed but recovered via repair=%s",
-                repair_name,
-            )
+            if repair_name != "llm":
+                logger.warning(
+                    "LM Studio response was malformed but recovered via repair=%s",
+                    repair_name,
+                )
             parsed = repaired
 
     if not isinstance(parsed, dict):
@@ -327,7 +415,10 @@ def run_pipeline(image_url: str, endpoint: Endpoint, config: Config) -> OCRResul
             raise ValueError(f"task={task.name} HTTP/network error: {exc}") from exc
         elapsed_total += elapsed_sec
         try:
-            parsed = parse_lm_studio_response(raw_text)
+            parsed = parse_lm_studio_response(
+                raw_text,
+                llm_repair=lambda r: _llm_repair_json(r, endpoint, config),
+            )
         except ValueError as exc:
             raise ValueError(f"task={task.name}: {exc}") from exc
         accumulator.update(parsed)

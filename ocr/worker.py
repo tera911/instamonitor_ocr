@@ -132,22 +132,38 @@ class OCRWorker:
             if not items:
                 return True, 0
             added = 0
+            in_flight_skipped = 0
+            failed_skipped = 0
             with in_flight_lock:
                 for item in items:
                     pk = str(item["pk"])
                     if pk in in_flight_pks:
+                        in_flight_skipped += 1
                         continue
+                    with self._failed_pks_lock:
+                        if pk in self._failed_pks:
+                            # 既に今プロセスで failure 確定した pk。再投入しても worker が
+                            # 即 skip するだけで何も進まないので queue にも積まない。
+                            failed_skipped += 1
+                            continue
                     in_flight_pks.add(pk)
                     item_queue.put(item)
                     added += 1
             with counter_lock:
                 counters["pages"] += 1
             logger.info(
-                "Fetched page items=%s added=%s queue_size=%s",
+                "Fetched page items=%s added=%s in_flight_skipped=%s failed_skipped=%s queue_size=%s",
                 len(items),
                 added,
+                in_flight_skipped,
+                failed_skipped,
                 item_queue.qsize(),
             )
+            # API は item を返したが追加できなかった = この cycle で進められる仕事は無い。
+            # in_flight にある分は worker が処理中で結果次第で API 応答が変わる可能性があり、
+            # その場合のみ retry の余地を残す。全部 _failed_pks なら exhausted で確定。
+            if added == 0 and in_flight_skipped == 0:
+                return True, 0
             return False, added
 
         def prefetcher() -> None:
