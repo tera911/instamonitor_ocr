@@ -14,9 +14,10 @@ from .config import Config
 
 
 try:
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 except ImportError:  # Pillow 未インストールでもリサイズだけスキップして動かす
     Image = None  # type: ignore[assignment]
+    UnidentifiedImageError = None  # type: ignore[assignment,misc]
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ def download_image_as_base64(image_url: str, config: Config) -> str:
     """画像を取得し、必要なら長辺 IMAGE_MAX_DIM にリサイズして base64 化する。"""
     image_bytes = load_image_bytes(image_url, config)
 
+    if not image_bytes:
+        # 0 byte。LM Studio 側で "cannot identify image file" 400 になり再試行不能。
+        raise OSError(f"Image bytes empty url={image_url}")
+
     if Image is not None:
         try:
             with Image.open(BytesIO(image_bytes)) as img:
@@ -106,6 +111,10 @@ def download_image_as_base64(image_url: str, config: Config) -> str:
                         save_image.size[1],
                         config.image_max_dim,
                     )
+        except UnidentifiedImageError as exc:
+            # PIL すら識別できない bytes は LM Studio も同じく弾く。再試行で
+            # 直らないので OSError として上層に投げ run_pipeline 側で empty 扱いに倒す。
+            raise OSError(f"Image data unrecognizable url={image_url}: {exc}") from exc
         except Exception as exc:
             logger.warning("Image resize failed, using original image error=%s", exc)
 
