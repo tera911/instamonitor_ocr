@@ -384,7 +384,29 @@ def run_pipeline(image_url: str, endpoint: Endpoint, config: Config) -> OCRResul
     タスクの後は skip_if_no_text なタスクをスキップする。
     """
     pipeline = TASK_PIPELINES[endpoint.mode]
-    image_b64 = download_image_as_base64(image_url, config)
+    try:
+        image_b64 = download_image_as_base64(image_url, config)
+    except OSError as exc:
+        # ローカルマウント (s3fs/FUSE) で is_file()=True なのに read_bytes() が
+        # PermissionError / FileNotFoundError を返すケース。再試行しても直らず、
+        # 失敗が _failed_pks にも積まれないため API が同じ pk を返し続けて
+        # 無限フェッチ loop になる。テキスト無し扱いで OCR 処理済みフラグだけ
+        # 立てて先へ進める。
+        logger.warning(
+            "Image unavailable url=%s error=%s: %s -- recording as no_text_detected",
+            image_url,
+            type(exc).__name__,
+            exc,
+        )
+        return OCRResult(
+            text="",
+            background="",
+            profile_estimate="",
+            is_pr=False,
+            is_ugc=False,
+            tags=[],
+            no_text_detected=True,
+        )
 
     accumulator: dict[str, Any] = {}
     elapsed_total = 0.0
