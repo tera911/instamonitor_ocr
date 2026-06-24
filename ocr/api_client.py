@@ -71,11 +71,13 @@ def request_with_retry(
     raise last_exc
 
 
-def fetch_latest_media(config: Config) -> list[dict[str, Any]]:
+def fetch_latest_media(config: Config, offset: int = 0) -> list[dict[str, Any]]:
     params: dict[str, Any] = {
         "limit": config.page_size,
         "current_version": config.ocr_version,
     }
+    if offset > 0:
+        params["offset"] = offset
     response = request_with_retry(
         "GET",
         f"{config.api_base_url}/media/latest",

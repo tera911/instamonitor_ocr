@@ -99,7 +99,7 @@ class Config:
             request_retry_count=max(1, int(os.getenv("REQUEST_RETRY_COUNT", "3"))),
             request_retry_backoff_sec=float(os.getenv("REQUEST_RETRY_BACKOFF_SEC", "2.0")),
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1920"))),
-            page_size=max(1, min(100, int(os.getenv("FETCH_PAGE_SIZE", "50")))),
+            page_size=max(1, min(200, int(os.getenv("FETCH_PAGE_SIZE", "50")))),
         )
 
 

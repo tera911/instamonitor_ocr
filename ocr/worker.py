@@ -124,10 +124,14 @@ class OCRWorker:
         counters = {"pages": 0, "processed": 0}
 
         def fetch_into_queue() -> tuple[bool, int]:
+            # 永続失敗 pk はサーバ側の未処理集合の先頭に居座り続けるので、その分 offset を
+            # 進めて次の page を取りに行く (= 失敗件数に応じて自然と前進する)。
+            with self._failed_pks_lock:
+                offset = len(self._failed_pks)
             try:
-                items = fetch_latest_media(self.config)
+                items = fetch_latest_media(self.config, offset=offset)
             except Exception:
-                logger.exception("Prefetch fetch_latest_media failed")
+                logger.exception("Prefetch fetch_latest_media failed offset=%s", offset)
                 return False, 0
             if not items:
                 return True, 0
