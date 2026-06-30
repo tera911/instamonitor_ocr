@@ -122,12 +122,18 @@ class OCRWorker:
         workers_done = threading.Event()
         counter_lock = threading.Lock()
         counters = {"pages": 0, "processed": 0}
+        # cycle ローカルの offset。サーバの list 先頭から page_size ずつ前進し、
+        # サーバが空 page を返した時点でこの cycle は終わる。`_failed_pks` の件数を
+        # offset に流用していた旧実装は、新着 item がサーバ list の top に積まれた
+        # 瞬間に整合性が崩れて (= 同じ failed pk の page を引き当て続けて) 詰まるため
+        # 廃止した。
+        cycle_offset = 0
+        cycle_offset_lock = threading.Lock()
 
         def fetch_into_queue() -> tuple[bool, int]:
-            # 永続失敗 pk はサーバ側の未処理集合の先頭に居座り続けるので、その分 offset を
-            # 進めて次の page を取りに行く (= 失敗件数に応じて自然と前進する)。
-            with self._failed_pks_lock:
-                offset = len(self._failed_pks)
+            nonlocal cycle_offset
+            with cycle_offset_lock:
+                offset = cycle_offset
             try:
                 items = fetch_latest_media(self.config, offset=offset)
             except Exception:
@@ -135,6 +141,8 @@ class OCRWorker:
                 return False, 0
             if not items:
                 return True, 0
+            with cycle_offset_lock:
+                cycle_offset += len(items)
             added = 0
             in_flight_skipped = 0
             failed_skipped = 0
@@ -146,8 +154,6 @@ class OCRWorker:
                         continue
                     with self._failed_pks_lock:
                         if pk in self._failed_pks:
-                            # 既に今プロセスで failure 確定した pk。再投入しても worker が
-                            # 即 skip するだけで何も進まないので queue にも積まない。
                             failed_skipped += 1
                             continue
                     in_flight_pks.add(pk)
@@ -156,18 +162,14 @@ class OCRWorker:
             with counter_lock:
                 counters["pages"] += 1
             logger.info(
-                "Fetched page items=%s added=%s in_flight_skipped=%s failed_skipped=%s queue_size=%s",
+                "Fetched page offset=%s items=%s added=%s in_flight_skipped=%s failed_skipped=%s queue_size=%s",
+                offset,
                 len(items),
                 added,
                 in_flight_skipped,
                 failed_skipped,
                 item_queue.qsize(),
             )
-            # API は item を返したが追加できなかった = この cycle で進められる仕事は無い。
-            # in_flight にある分は worker が処理中で結果次第で API 応答が変わる可能性があり、
-            # その場合のみ retry の余地を残す。全部 _failed_pks なら exhausted で確定。
-            if added == 0 and in_flight_skipped == 0:
-                return True, 0
             return False, added
 
         def prefetcher() -> None:
@@ -175,12 +177,13 @@ class OCRWorker:
                 if item_queue.qsize() >= low_watermark:
                     time.sleep(0.2)
                     continue
-                exhausted, added = fetch_into_queue()
+                exhausted, _added = fetch_into_queue()
                 if exhausted:
                     fetch_done.set()
                     return
-                if added == 0:
-                    time.sleep(1.0)
+                # added==0 でも cycle_offset は前進済み。
+                # 全件 failed_skipped の page を歩き抜けて fresh item に辿り着くため、
+                # ここでは sleep せず即次の page を取りに行く。
 
         exhausted, _added = fetch_into_queue()
         if exhausted:
