@@ -147,7 +147,7 @@ def run_test_mode(
     最大同時接続数)。pipeline 1 件あたり画像 download + LLM call が含まれるので、
     LLM が GPU bound でも HTTP/画像 download の遅延を隠して endpoint を使い切る。
     """
-    page = fetch_latest_media(config)
+    page, _past_count = fetch_latest_media(config)
     candidates = _collect_target_items(page, target_pks, limit, skip_no_text_detect)
     if not candidates:
         if target_pks is None:
