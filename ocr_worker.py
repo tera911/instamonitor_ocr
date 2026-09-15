@@ -11,4 +11,8 @@ from ocr.cli import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # LLM 死活監視がメインスレッドへ送る SIGINT もここで受けて異常終了にする。
+        raise SystemExit(1)

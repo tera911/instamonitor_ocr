@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .config import Config, load_dotenv_file
 from .dashboard import DashboardState, draw_dashboard
+from .health import find_dead_endpoint, start_llm_health_monitor
 from .logging_setup import DashboardLogHandler, setup_file_logging
 from .test_runner import run_test_mode
 from .worker import OCRWorker
@@ -154,6 +155,13 @@ def main() -> int:
             skip_no_text_detect=args.skip_no_text_detect,
             report_dir=Path(args.report_dir) if args.report else None,
         )
+
+    dead = find_dead_endpoint(config)
+    if dead is not None:
+        endpoint, error = dead
+        logger.error("LLM endpoint unavailable endpoint=%s error=%s", endpoint.url, error)
+        return 1
+    start_llm_health_monitor(config)
 
     if args.no_dashboard:
         worker = OCRWorker(config)
