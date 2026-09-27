@@ -171,6 +171,7 @@ OCR_TEXT_SCHEMA: dict[str, Any] = {
 # schema を 1 フィールドに減らし、テキスト無し判定は run_pipeline 側で行う。
 OCR_TEXT_PROMPT = f"""You are an OCR engine for Japanese/English Instagram images.
 Extract every readable character drawn in the image and put it into `text`.
+- Include small text in the corners and along the edges of the image, such as a tiny "PR" / "pr" disclosure mark, watermarks, or account names. Do not skip text because it is small, thin, or low-contrast.
 - Preserve line breaks with `\\n` (max two consecutive).
 - Do not translate, rewrite, summarize, or normalize the text.
 - If the image contains NO readable text at all, write the literal token `<empty>` (and nothing else) as the value of `text`.
@@ -313,11 +314,10 @@ TASK_CLASSIFICATION = OcrTask(
     prompt=CLASSIFICATION_PROMPT,
     schema=CLASSIFICATION_SCHEMA,
     fields=("is_pr", "is_ugc", "tags"),
-    # is_ugc / tags は画像視覚で判定可能、is_pr は text 必須だが OCR `(no text)` 時は
-    # 画像内に "PR" 文字が無いので自動的に false に倒れる想定。CONTEXT と同様に実行する。
+    # is_pr は OCR テキストに加えて画像も直接読み、OCR テキスト無しでも判定する。
     needs_ocr_text=True,
-    # 分類タスクも荒い視覚で十分なので低解像度に倒して速度を稼ぐ。
-    max_soft_tokens=140,
+    # 画像の隅の小さい PR 表記を読むため、高解像度にする。
+    max_soft_tokens=1120,
 )
 
 TASK_ALL_IN_ONE = OcrTask(

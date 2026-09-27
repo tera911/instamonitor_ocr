@@ -104,7 +104,7 @@ def call_lm_studio(
     raw_text = (
         body.get("choices", [{}])[0]
         .get("message", {})
-        .get("content", "")
+        .get("content") or ""
     )
     elapsed_sec = time.perf_counter() - started_at
     return raw_text, elapsed_sec
