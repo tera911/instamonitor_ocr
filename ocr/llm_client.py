@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -35,11 +36,12 @@ class OCRResult:
 def call_lm_studio(
     image_b64: str,
     prompt: str,
-    schema: dict[str, Any],
+    schema: dict[str, Any] | None,
     endpoint_url: str,
     config: Config,
     disable_thinking: bool = False,
     max_soft_tokens: int | None = None,
+    sampling: Mapping[str, Any] | None = None,
 ) -> tuple[str, float]:
     """1 タスク分の LLM 呼び出し。画像はあらかじめ base64 化したものを受け取る。
 
@@ -50,6 +52,7 @@ def call_lm_studio(
     入れる。vLLM の Gemma 系 reasoning モードを切る用途。
     max_soft_tokens=N で mm_processor_kwargs.max_soft_tokens=N を入れる。Gemma 4 系の
     vision token 数 (画像解像度) をタスク別に切り替える用途。
+    sampling の生成パラメータを payload に展開する。
     未知フィールドはサーバー側で silently 無視されるので、LM Studio / 旧 vLLM でも
     そのまま動く (= 効かないだけで壊れない)。
     """
@@ -71,15 +74,18 @@ def call_lm_studio(
             }
         ],
         "max_tokens": config.lm_studio_max_tokens,
-        "response_format": {
+    }
+    if schema is not None:
+        payload["response_format"] = {
             "type": "json_schema",
             "json_schema": schema,
-        },
-    }
+        }
     if disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     if max_soft_tokens is not None:
         payload["mm_processor_kwargs"] = {"max_soft_tokens": max_soft_tokens}
+    if sampling:
+        payload.update(sampling)
 
     response = requests.post(
         endpoint_url,
@@ -431,21 +437,25 @@ def run_pipeline(image_url: str, endpoint: Endpoint, config: Config) -> OCRResul
                 config,
                 disable_thinking=task.disable_thinking,
                 max_soft_tokens=task.max_soft_tokens,
+                sampling=task.sampling,
             )
         except requests.RequestException as exc:
             # どのタスク段で失敗したかを上層 (report 等) で識別できるよう task 名を含める。
             raise ValueError(f"task={task.name} HTTP/network error: {exc}") from exc
         elapsed_total += elapsed_sec
         try:
-            parsed = parse_lm_studio_response(
-                raw_text,
-                llm_repair=lambda r: _llm_repair_json(r, endpoint, config),
-            )
+            if task.schema is None:
+                parsed = {task.fields[0]: raw_text.strip()}
+            else:
+                parsed = parse_lm_studio_response(
+                    raw_text,
+                    llm_repair=lambda r: _llm_repair_json(r, endpoint, config),
+                )
         except ValueError as exc:
             raise ValueError(f"task={task.name}: {exc}") from exc
         accumulator.update(parsed)
         if task.derive_no_text_detected:
-            # schema を text 1 つに絞った OCR タスク用。LLM に書かせず Python 側で判定する。
+            # OCR テキストの有無は LLM に書かせず Python 側で判定する。
             text_value = str(accumulator.get("text", "")).strip()
             is_empty = text_value == "" or text_value == "<empty>"
             if is_empty:

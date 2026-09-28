@@ -114,7 +114,7 @@ systemd や cron などダッシュボードを出せない環境向けにログ
   - `DEFAULT_PROMPT` + `OCR_RESPONSE_SCHEMA` を 1 リクエストで投げる
   - 全項目を 1 度で生成する従来動作
 - **split mode** (`mode = "split"`)
-  - `OCR_TEXT_PROMPT` + `OCR_TEXT_SCHEMA` (text / no_text_detected)
+  - `OCR_TEXT_PROMPT` でプレーンテキストを返し、`text` に格納する。`no_text_detected` は空白 / `<empty>` から Python 側で判定し、同じパターンの繰り返しは `repetition_detection` で打ち切る
   - `CONTEXT_PROMPT` + `CONTEXT_SCHEMA` (background / profile_estimate, 画像 + OCR テキストを入力)
   - `CLASSIFICATION_PROMPT` + `CLASSIFICATION_SCHEMA` (is_pr / is_ugc / tags, 画像 + OCR テキストを入力)
   - を順に投げ、結果をマージして 1 件の出力 JSON にする
@@ -127,7 +127,7 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 | --- | --- |
 | `name` | ログ表示用の識別子 (例: `"ocr"`, `"context"`, `"safety_check"`) |
 | `prompt` | このタスクで送るプロンプト。`needs_ocr_text=True` なら `{ocr_text}` プレースホルダで OCR 結果が埋め込まれる |
-| `schema` | このタスクの Structured Outputs 用 JSON schema |
+| `schema` | このタスクの Structured Outputs 用 JSON schema。`None` ならプレーンテキストの応答全文を `fields[0]` に格納する |
 | `fields` | このタスクが埋めるキー (ログ / バリデーション用) |
 | `skip_if_no_text` | 直前までに `no_text_detected=true` が立っていたらスキップする |
 | `needs_ocr_text` | prompt に OCR 結果テキストを差し込む |
@@ -138,7 +138,7 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 
 ## 出力JSON
 
-### モデルに要求している返却 JSON
+### パイプラインの出力 JSON
 
 ```json
 {
@@ -152,12 +152,13 @@ systemd や cron などダッシュボードを出せない環境向けにログ
 }
 ```
 
-出力 JSON は LM Studio の Structured Outputs (`response_format: json_schema`) で文法的に強制しているため、バックスラッシュ未エスケープ等の不正 JSON が物理的に発生しません。万一に備えてパーサーは最初の `{` から最後の `}` までを切り出すフォールバックも持っています。
+split の OCR は Structured Outputs を使わず、プレーンテキストの応答を `text` として取り込みます。文脈・分類タスクと oneshot は Structured Outputs (`response_format: json_schema`) を使います。各タスクの結果を上記の出力 JSON にまとめます。JSON パーサーは最初の `{` から最後の `}` までを切り出すフォールバックも持っています。
 
-### 推論暴走対策 (max_tokens / maxLength)
+### 推論暴走対策 (max_tokens / maxLength / repetition_detection)
 
-文字びっしりの画像や、モデルが緩いループに陥ったときに推論が止まらず `LM_STUDIO_TIMEOUT_SEC` を踏み抜くことがあります。これを抑えるため、payload に `max_tokens` を、schema の各フィールドに `maxLength` / `maxItems` を入れています。
+文字びっしりの画像や、モデルが緩いループに陥ったときに推論が止まらず `LM_STUDIO_TIMEOUT_SEC` を踏み抜くことがあります。これを抑えるため、payload に `max_tokens` を、Structured Outputs を使うタスクの schema の各フィールドに `maxLength` / `maxItems` を入れています。
 
+- split OCR の `repetition_detection` (`min_pattern_size=1`, `max_pattern_size=64`, `min_count=8`) — 同じパターンの繰り返しを打ち切ります
 - `LM_STUDIO_MAX_TOKENS` (デフォルト 4096, 最小 64) — 推論時間そのものを切るためのハード上限。ループ系のタイムアウトに直接効きます
 - schema 側の `maxLength` (text=8000, background=1000, profile_estimate=1000, tags items=64, tags maxItems=20) — LM Studio (llama.cpp) の GBNF grammar に量化子として落ちて、内容が長くなりすぎることを構文レベルで防ぎます
 

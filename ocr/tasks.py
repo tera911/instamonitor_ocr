@@ -11,7 +11,8 @@ Q4 量子化モデルで OCR と分類タスクを 1 プロンプトに混ぜる
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -114,6 +115,8 @@ OCR_RESPONSE_SCHEMA: dict[str, Any] = {
 class OcrTask:
     """OCR ワーカが 1 リクエストで LLM に投げる「ひとかたまりの仕事」の定義。
 
+    schema: None のときは Structured Outputs を使わずプレーンテキストで返させ、
+        応答全文を fields[0] の値として扱う。
     skip_if_no_text: True のとき、これより前のタスクで no_text_detected=True が立ったら
         このタスクは丸ごとスキップする。OCR で「テキストなし」と判定された画像に対して、
         is_pr / tags 等の重い判定を回さないための短絡。
@@ -127,62 +130,40 @@ class OcrTask:
         サイレントに無視される (LM Studio / 旧 vLLM)。
     derive_no_text_detected: True のとき、task 完了後に accumulator["text"] を見て
         `<empty>` / 空白だけ を「テキスト無し」と解釈し、text を "" にリセットして
-        no_text_detected=True を accumulator に詰める。OCR タスクの schema を text 1 つ
-        に絞り、判断責務を Python 側に持つための仕組み。
+        no_text_detected=True を accumulator に詰める。テキスト無しの判断責務を
+        Python 側に持つための仕組み。
     max_soft_tokens: Gemma 4 系の vision token 数をリクエストレベルで上書きする。
         None なら指定なし (= サーバ起動時設定 or モデルデフォルト)。
-        サポート値: 70 / 140 / 280 / 560 / 1120。OCR は 1120 (高解像度) で、
-        背景・分類タスクは 140 (低解像度) を割り当てるなど用途別の精度/速度
+        サポート値: 70 / 140 / 280 / 560 / 1120。OCR・分類は 560 (高解像度) で、
+        背景タスクは 140 (低解像度) を割り当てるなど用途別の精度/速度
         トレードオフを宣言する。注意: vLLM 0.23 ではリクエストレベルの
         mm_processor_kwargs が silently 無視される事例が観測されているため、
         確実に効かせたい解像度はサーバー起動引数
         `--mm-processor-kwargs '{"max_soft_tokens": <n>}'` で張った上で、
         下げたいタスクだけ payload 上書きするのが安全。
+    sampling: リクエスト payload に展開する生成パラメータ。未知フィールドはサーバーが無視する。
     fields: このタスクが結果として埋めるキー (ロギング / バリデーション用)。
     """
 
     name: str
     prompt: str
-    schema: dict[str, Any]
+    schema: dict[str, Any] | None
     fields: tuple[str, ...]
     skip_if_no_text: bool = False
     needs_ocr_text: bool = False
     disable_thinking: bool = False
     derive_no_text_detected: bool = False
     max_soft_tokens: int | None = None
+    sampling: Mapping[str, Any] = field(default_factory=dict)
 
 
-OCR_TEXT_SCHEMA: dict[str, Any] = {
-    "name": "ocr_text",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "text": {"type": "string", "maxLength": 4000},
-        },
-        "required": ["text"],
-        "additionalProperties": False,
-    },
-}
-
-
-# OCR タスクは「text を出すか、`<empty>` を返すか」の 2 択にして判断項目をゼロに絞る。
-# Q4 12B モデルが no_text_detected の真偽判定で本文に JSON を混ぜる事故が出ていたので、
-# schema を 1 フィールドに減らし、テキスト無し判定は run_pipeline 側で行う。
-OCR_TEXT_PROMPT = f"""You are an OCR engine for Japanese/English Instagram images.
-Extract every readable character drawn in the image and put it into `text`.
-- Include small text in the corners and along the edges of the image, such as a tiny "PR" / "pr" disclosure mark, watermarks, or account names. Do not skip text because it is small, thin, or low-contrast.
-- Preserve line breaks with `\\n` (max two consecutive).
+OCR_TEXT_PROMPT = """You are an OCR engine for Japanese/English Instagram images.
+Extract every readable character drawn in the image.
+- Include small text in the corners and along the edges of the image, such as tiny labels, disclosure marks, watermarks, or account names. Do not skip text because it is small, thin, or low-contrast.
+- Preserve line breaks (max two consecutive).
 - Do not translate, rewrite, summarize, or normalize the text.
-- If the image contains NO readable text at all, write the literal token `<empty>` (and nothing else) as the value of `text`.
-- Do NOT add any other field. Do NOT write `no_text_detected`. The schema only allows `text`.
-
-{_TEXT_FIDELITY_RULES}
-
-{_JSON_OUTPUT_RULES}
-
-JSON shape:
-{{"text":"<extracted text or <empty>>"}}"""
+- If the image contains NO readable text at all, output the literal token `<empty>` and nothing else.
+Output ONLY the extracted text as plain text (no JSON, no commentary)."""
 
 
 CONTEXT_SCHEMA: dict[str, Any] = {
@@ -285,16 +266,23 @@ JSON shape:
 TASK_OCR = OcrTask(
     name="ocr",
     prompt=OCR_TEXT_PROMPT,
-    schema=OCR_TEXT_SCHEMA,
+    schema=None,
     fields=("text",),
     # OCR は視覚を読み取るだけのタスクで思考連鎖は不要なため、reasoning を切って
     # 出力 token を OCR テキスト本体に振り向ける。
     disable_thinking=True,
-    # text 1 フィールドだけ書かせ、no_text_detected は run_pipeline 側で text の
+    # プレーンテキストを返させ、no_text_detected は run_pipeline 側で text の
     # 空 / `<empty>` 判定から導出する。
     derive_no_text_detected=True,
-    # 文字を粒子レベルで読み取る必要があるので vision token 上限の 1120 を割り当てる。
-    max_soft_tokens=1120,
+    # 12B で正常に読める vision token 上限の 560 を割り当てる。
+    max_soft_tokens=560,
+    # 同じ語や空白の繰り返しで max_tokens まで暴走するのを抑え、読み取りを決定的にする。
+    # repetition_detection で同じパターンの繰り返しを打ち切る。
+    sampling={
+        "temperature": 0,
+        "repetition_penalty": 1.05,
+        "repetition_detection": {"max_pattern_size": 64, "min_pattern_size": 1, "min_count": 8},
+    },
 )
 
 TASK_CONTEXT = OcrTask(
@@ -316,8 +304,8 @@ TASK_CLASSIFICATION = OcrTask(
     fields=("is_pr", "is_ugc", "tags"),
     # is_pr は OCR テキストに加えて画像も直接読み、OCR テキスト無しでも判定する。
     needs_ocr_text=True,
-    # 画像の隅の小さい PR 表記を読むため、高解像度にする。
-    max_soft_tokens=1120,
+    # 画像の隅の小さい PR 表記を読むため、12B で使える上限の解像度にする。
+    max_soft_tokens=560,
 )
 
 TASK_ALL_IN_ONE = OcrTask(
