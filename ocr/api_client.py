@@ -72,18 +72,19 @@ def request_with_retry(
 
 
 def fetch_latest_media(
-    config: Config, past_offset: int = 0
-) -> tuple[list[dict[str, Any]], int]:
-    """当日分 (offset 不要・日次で自然にリセットされるカーソル) + 過去分 (past_offset で
-    永続失敗 pk を飛ばして前進) を返す。past_offset は呼び出し側が今回のレスポンスに
-    含まれていた過去分の件数 (戻り値の2番目) を積算して次回に渡す。
+    config: Config, past_before: str | None = None
+) -> tuple[list[dict[str, Any]], str | None]:
+    """当日分 (古い順) + 過去分 (新しい順・past_before より前) を返す。
+
+    2 番目の戻り値は過去分の次のカーソルで、次回の past_before にそのまま渡す。
+    今回過去分が返らなかったときは None。
     """
     params: dict[str, Any] = {
         "limit": config.page_size,
         "current_version": config.ocr_version,
     }
-    if past_offset > 0:
-        params["past_offset"] = past_offset
+    if past_before is not None:
+        params["past_before"] = past_before
     response = request_with_retry(
         "GET",
         f"{config.api_base_url}/media/latest",
@@ -92,7 +93,7 @@ def fetch_latest_media(
         timeout=config.request_timeout_sec,
     )
     payload = response.json()
-    return list(payload.get("data", [])), int(payload.get("past_count", 0))
+    return list(payload.get("data", [])), payload.get("past_cursor")
 
 
 def post_ocr_result(pk: str, result: OCRResult, config: Config) -> None:

@@ -122,30 +122,32 @@ class OCRWorker:
         workers_done = threading.Event()
         counter_lock = threading.Lock()
         counters = {"pages": 0, "processed": 0}
-        # cycle ローカルの past_offset。当日分はサーバ側で `ocr IS NULL` 系フィルタが
-        # 日次で自然にリセットされるカーソルなので offset 不要 (毎回先頭 = 当日最古の
-        # 未処理から)。past_offset は過去分だけを対象に、サーバが返した過去分件数
-        # (past_count) ずつ前進させる。当日/過去を1本の offset で共有していた旧実装は、
-        # 失敗 pk の蓄積で offset が当日分の件数を恒久的に超えてしまい、当日分が
-        # 二度と返らなくなる (= 過去分モードから戻れない) 不具合があったため分離した。
-        cycle_past_offset = 0
-        cycle_offset_lock = threading.Lock()
+        # 過去分のカーソル。サーバは新しい順にこれより前の未処理を返す。
+        # 日付の切り替わりや翌日保存でカーソルより新しい過去分が増えるので、
+        # 一定時間ごとに先頭 (いちばん新しい過去分) へ戻す。
+        past_cursor: str | None = None
+        cursor_reset_at = time.monotonic()
+        cursor_lock = threading.Lock()
 
         def fetch_into_queue() -> tuple[bool, int]:
-            nonlocal cycle_past_offset
-            with cycle_offset_lock:
-                past_offset = cycle_past_offset
+            nonlocal past_cursor, cursor_reset_at
+            with cursor_lock:
+                if time.monotonic() - cursor_reset_at >= self.config.past_cursor_reset_sec:
+                    past_cursor = None
+                    cursor_reset_at = time.monotonic()
+                past_before = past_cursor
             try:
-                items, past_count = fetch_latest_media(self.config, past_offset=past_offset)
+                items, next_cursor = fetch_latest_media(self.config, past_before=past_before)
             except Exception:
                 logger.exception(
-                    "Prefetch fetch_latest_media failed past_offset=%s", past_offset
+                    "Prefetch fetch_latest_media failed past_before=%s", past_before
                 )
                 return False, 0
             if not items:
                 return True, 0
-            with cycle_offset_lock:
-                cycle_past_offset += past_count
+            if next_cursor is not None:
+                with cursor_lock:
+                    past_cursor = next_cursor
             added = 0
             in_flight_skipped = 0
             failed_skipped = 0
@@ -165,11 +167,11 @@ class OCRWorker:
             with counter_lock:
                 counters["pages"] += 1
             logger.info(
-                "Fetched page past_offset=%s items=%s past_count=%s added=%s "
+                "Fetched page past_before=%s items=%s next_cursor=%s added=%s "
                 "in_flight_skipped=%s failed_skipped=%s queue_size=%s",
-                past_offset,
+                past_before,
                 len(items),
-                past_count,
+                next_cursor,
                 added,
                 in_flight_skipped,
                 failed_skipped,
@@ -186,7 +188,7 @@ class OCRWorker:
                 if exhausted:
                     fetch_done.set()
                     return
-                # added==0 でも cycle_past_offset は前進済み。
+                # added==0 でも過去分のカーソルは前進済み。
                 # 全件 failed_skipped の page を歩き抜けて fresh item に辿り着くため、
                 # ここでは sleep せず即次の page を取りに行く。
 
