@@ -48,6 +48,7 @@ class Config:
     request_retry_backoff_sec: float
     image_max_dim: int
     page_size: int
+    past_cursor_reset_sec: float
 
     @property
     def total_concurrency(self) -> int:
@@ -100,6 +101,7 @@ class Config:
             request_retry_backoff_sec=float(os.getenv("REQUEST_RETRY_BACKOFF_SEC", "2.0")),
             image_max_dim=max(256, int(os.getenv("IMAGE_MAX_DIM", "1920"))),
             page_size=max(1, min(200, int(os.getenv("FETCH_PAGE_SIZE", "50")))),
+            past_cursor_reset_sec=float(os.getenv("PAST_CURSOR_RESET_SEC", "600")),
         )
 
 
