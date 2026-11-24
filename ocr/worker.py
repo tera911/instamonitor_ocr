@@ -32,6 +32,13 @@ class OCRWorker:
         self.dashboard_state = dashboard_state
         self._failed_pks_lock = threading.Lock()
         self._failed_pks: set[str] = set()
+        # 過去分のカーソル。サーバは新しい順にこれより前の未処理を返す。
+        # サイクルをまたいで持ち越し、読み終えた範囲をサイクルのたびに読み直さない。
+        # 日付の切り替わりや翌日保存でカーソルより新しい過去分が増えるので、
+        # 一定時間ごとに先頭 (いちばん新しい過去分) へ戻す。
+        self._past_cursor: str | None = None
+        self._past_cursor_reset_at = time.monotonic()
+        self._past_cursor_lock = threading.Lock()
 
     def _process_media_item(self, item: dict[str, Any], endpoint: Endpoint) -> bool:
         pk = str(item["pk"])
@@ -122,20 +129,13 @@ class OCRWorker:
         workers_done = threading.Event()
         counter_lock = threading.Lock()
         counters = {"pages": 0, "processed": 0}
-        # 過去分のカーソル。サーバは新しい順にこれより前の未処理を返す。
-        # 日付の切り替わりや翌日保存でカーソルより新しい過去分が増えるので、
-        # 一定時間ごとに先頭 (いちばん新しい過去分) へ戻す。
-        past_cursor: str | None = None
-        cursor_reset_at = time.monotonic()
-        cursor_lock = threading.Lock()
 
         def fetch_into_queue() -> tuple[bool, int]:
-            nonlocal past_cursor, cursor_reset_at
-            with cursor_lock:
-                if time.monotonic() - cursor_reset_at >= self.config.past_cursor_reset_sec:
-                    past_cursor = None
-                    cursor_reset_at = time.monotonic()
-                past_before = past_cursor
+            with self._past_cursor_lock:
+                if time.monotonic() - self._past_cursor_reset_at >= self.config.past_cursor_reset_sec:
+                    self._past_cursor = None
+                    self._past_cursor_reset_at = time.monotonic()
+                past_before = self._past_cursor
             try:
                 items, next_cursor = fetch_latest_media(self.config, past_before=past_before)
             except Exception:
@@ -143,11 +143,12 @@ class OCRWorker:
                     "Prefetch fetch_latest_media failed past_before=%s", past_before
                 )
                 return False, 0
+            # 過去分を読み切った応答は空でもカーソル (下限より前) を返すので、空の判定より先に受け取る
+            if next_cursor is not None:
+                with self._past_cursor_lock:
+                    self._past_cursor = next_cursor
             if not items:
                 return True, 0
-            if next_cursor is not None:
-                with cursor_lock:
-                    past_cursor = next_cursor
             added = 0
             in_flight_skipped = 0
             failed_skipped = 0
