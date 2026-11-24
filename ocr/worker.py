@@ -25,6 +25,9 @@ from .utils import format_taken_at, response_body_for_log
 
 logger = logging.getLogger(__name__)
 
+# 取得で何も足せず、過去分のカーソルも進まなかったときに、次の取得まで待つ秒数
+STALLED_FETCH_WAIT_SEC = 1.0
+
 
 class OCRWorker:
     def __init__(self, config: Config, dashboard_state: DashboardState | None = None):
@@ -185,13 +188,17 @@ class OCRWorker:
                 if item_queue.qsize() >= low_watermark:
                     time.sleep(0.2)
                     continue
-                exhausted, _added = fetch_into_queue()
+                cursor_before = self._past_cursor
+                exhausted, added = fetch_into_queue()
                 if exhausted:
                     fetch_done.set()
                     return
-                # added==0 でも過去分のカーソルは前進済み。
-                # 全件 failed_skipped の page を歩き抜けて fresh item に辿り着くため、
-                # ここでは sleep せず即次の page を取りに行く。
+                # added==0 でもカーソルが進んだなら、全件 failed_skipped の page を
+                # 歩き抜けて fresh item に辿り着くため、待たずに次の page を取りに行く。
+                # カーソルも進まないなら処理中・失敗済みの行しか返っていないので、
+                # 同じ応答を取り続けないよう少し待つ。
+                if added == 0 and self._past_cursor == cursor_before:
+                    time.sleep(STALLED_FETCH_WAIT_SEC)
 
         exhausted, _added = fetch_into_queue()
         if exhausted:
