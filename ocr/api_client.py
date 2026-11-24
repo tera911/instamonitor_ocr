@@ -77,7 +77,8 @@ def fetch_latest_media(
     """当日分 (古い順) + 過去分 (新しい順・past_before より前) を返す。
 
     2 番目の戻り値は過去分の次のカーソルで、次回の past_before にそのまま渡す。
-    今回過去分が返らなかったときは None。
+    過去分を読み切ったときは、空の応答でも下限より前を指すカーソルが返る。
+    当日分で枠が埋まり過去分を読まなかったときは None。
     """
     params: dict[str, Any] = {
         "limit": config.page_size,

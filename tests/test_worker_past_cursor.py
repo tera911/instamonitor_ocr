@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -17,12 +18,19 @@ from ocr.config import Endpoint
 from ocr.worker import OCRWorker
 
 
+BELOW_LOWER_BOUND = "0:0"
+
+
 class FakeServer:
-    """過去分だけを持つ /media/latest。新しい順に、カーソルより前の未処理を返す。"""
+    """/media/latest。当日分の未処理を先に返し、枠が余れば過去分を新しい順に、カーソルより前から返す。
+
+    過去分を読み切った (残りの枠より少なく返した) ときは、空の応答でも下限 (pk=1) より前のカーソルを返す。
+    """
 
     def __init__(self, pks: list[int], page_size: int):
         # taken_at は pk と同じ値にして、新しい順 = pk の大きい順にする
         self.rows = sorted(pks, reverse=True)
+        self.today: list[int] = []
         self.page_size = page_size
         self.processed: set[str] = set()
         self.calls: list[str | None] = []
@@ -32,16 +40,26 @@ class FakeServer:
         with self.lock:
             self.calls.append(past_before)
             before = int(past_before.split(":")[1]) if past_before else None
-            page = [
+            today = [pk for pk in self.today if str(pk) not in self.processed][: self.page_size]
+            remaining = self.page_size - len(today)
+            past = [
                 pk for pk in self.rows
                 if str(pk) not in self.processed and (before is None or pk < before)
-            ][: self.page_size]
-        items = [{"pk": str(pk), "taken_at": pk, "image_url": f"/{pk}.jpg"} for pk in page]
-        cursor = f"{page[-1]}:{page[-1]}" if page else None
+            ][:remaining]
+        items = [{"pk": str(pk), "taken_at": pk, "image_url": f"/{pk}.jpg"} for pk in today + past]
+        if remaining == 0:
+            return items, None
+        cursor = f"{past[-1]}:{past[-1]}" if len(past) == remaining else BELOW_LOWER_BOUND
         return items, cursor
 
+    def add(self, pk: int) -> None:
+        with self.lock:
+            self.rows = sorted(self.rows + [pk], reverse=True)
 
-def make_worker(server: FakeServer, failing: set[str], reset_sec: float) -> OCRWorker:
+
+def make_worker(
+    server: FakeServer, failing: set[str], reset_sec: float, process_sec: float = 0
+) -> OCRWorker:
     config = SimpleNamespace(
         endpoints=[Endpoint(url="http://lm", concurrency=1, mode="oneshot")],
         total_concurrency=1,
@@ -52,6 +70,7 @@ def make_worker(server: FakeServer, failing: set[str], reset_sec: float) -> OCRW
 
     def process(item, endpoint):
         pk = str(item["pk"])
+        time.sleep(process_sec)
         if pk in failing:
             with worker._failed_pks_lock:
                 worker._failed_pks.add(pk)
@@ -90,6 +109,66 @@ class PastCursorTest(unittest.TestCase):
 
         self.assertEqual(server.processed, {str(pk) for pk in range(1, 6)})
         self.assertTrue(all(call is None for call in server.calls), server.calls)
+
+
+class CarriedCursorTest(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeServer([], page_size=2)
+        self.worker = make_worker(self.server, failing=set(), reset_sec=600)
+        patcher = mock.patch.object(worker_module, "fetch_latest_media", self.server.fetch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cycle(self) -> list[str | None]:
+        """1 サイクル回し、そのサイクルで送った past_before を返す。"""
+        self.server.calls.clear()
+        self.worker.process_cycle()
+        return list(self.server.calls)
+
+    # 過去分を読み切った後の次のサイクルは、先頭からではなく下限より前のカーソルから読む
+    def test_cursor_is_carried_over_to_next_cycle(self):
+        for pk in range(1, 4):
+            self.server.add(pk)
+
+        self.assertEqual(self.run_cycle(), [None, "2:2", BELOW_LOWER_BOUND])
+        self.assertEqual(self.run_cycle(), [BELOW_LOWER_BOUND])
+
+    # 何も返らない応答でも、下限より前のカーソルを受け取って次のサイクルに持ち越す
+    def test_cursor_is_kept_from_empty_response(self):
+        self.assertEqual(self.run_cycle(), [None])
+        self.assertEqual(self.run_cycle(), [BELOW_LOWER_BOUND])
+
+    # カーソルより新しい側に増えた未処理 (日付の切り替わりで過去分に移った前日分、
+    # 新しい OCR の版でのやり直し) は、リセット間隔を過ぎてカーソルを戻した後に処理する
+    def test_rows_above_cursor_are_processed_after_reset(self):
+        self.run_cycle()
+        self.server.add(9)
+
+        self.run_cycle()
+        self.assertEqual(self.server.processed, set())
+
+        self.worker._past_cursor_reset_at -= self.worker.config.past_cursor_reset_sec
+        self.assertEqual(self.run_cycle()[0], None)
+        self.assertEqual(self.server.processed, {"9"})
+
+    # 再起動 (OCR の版を変えたときを含む) の後は、いちばん新しい過去分から読む
+    def test_restarted_worker_starts_from_newest_past(self):
+        self.run_cycle()
+        self.server.add(4)
+
+        self.worker = make_worker(self.server, failing=set(), reset_sec=600)
+        self.assertEqual(self.run_cycle()[0], None)
+        self.assertEqual(self.server.processed, {"4"})
+
+    # OCR 中の当日分しか返らず、カーソルも進まない間は、待たずに取得を繰り返さない
+    def test_waits_while_only_in_flight_rows_are_returned(self):
+        self.server.today = [100]
+        self.worker = make_worker(self.server, failing=set(), reset_sec=600, process_sec=0.5)
+
+        self.run_cycle()
+
+        self.assertEqual(self.server.processed, {"100"})
+        self.assertLessEqual(len(self.server.calls), 3)
 
 
 if __name__ == "__main__":
